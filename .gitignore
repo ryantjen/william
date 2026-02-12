@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+.venv/
+
+# User data (each user gets their own)
+app_data/
+chroma_storage/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated files
+plot.png
+
+# IDE
+.vscode/
+.idea/
