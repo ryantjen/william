@@ -51,6 +51,21 @@ You can get an API key from [OpenAI's platform](https://platform.openai.com/api-
 
 ### 5. Run the app
 
+**Quick Start (Recommended):**
+
+*Windows:*
+```bash
+run_agent.bat
+```
+Double-click the file or run it from command prompt.
+
+*Mac/Linux:*
+```bash
+chmod +x run_agent.sh   # First time only - make it executable
+./run_agent.sh
+```
+
+**Manual Start:**
 ```bash
 streamlit run app.py
 ```
@@ -72,14 +87,17 @@ run: print("Hello, World!")
 nlrun: plot a sine wave from 0 to 2pi
 ```
 
-### Pin Important Info
-Click the 📌 button on any assistant message to save it as a core memory.
+### Save to Memory
+Click the 💾 **Save to Memory** button on any assistant message to extract and store important knowledge (theorems, insights, formulas, etc.).
+
+### Add Memory
+Use the **Add Memory** tab to paste text (notes, formulas, excerpts) and have the agent extract structured memories from it.
 
 ### File Ingestion
 Go to the **Files** tab to upload PDFs, CSVs, or text files. They'll be chunked and stored in your memory for retrieval.
 
 ### Memory Dashboard
-Use the **Memory** tab to search, filter, and manage your stored memories by type, date, or keyword.
+Use the **Memory Dashboard** tab to search, filter, and manage your stored memories by type, date, or keyword.
 
 ## Project Structure
 
@@ -94,6 +112,8 @@ william/
 ├── ingest_files.py     # File-specific ingestion (PDF, CSV, TXT)
 ├── config.py           # Configuration and API settings
 ├── requirements.txt    # Python dependencies
+├── run_agent.bat       # Quick start script (Windows)
+├── run_agent.sh        # Quick start script (Mac/Linux)
 └── .env                # Your API key (not committed)
 ```
 
