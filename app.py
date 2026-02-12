@@ -1,10 +1,8 @@
 # app.py
-import io
 import re
 import time
 import streamlit as st
 import pandas as pd
-from pypdf import PdfReader
 
 from agent import ask_agent, execute_natural_language
 from tools import run_python
@@ -34,7 +32,6 @@ from memory import (
     list_memories, delete_memory, count_memories
 )
 
-from ingest import chunk_text
 from ingest_files import file_sha256, ingest_txt, ingest_csv, ingest_pdf
 
 st.set_page_config(page_title="Statistical Research Copilot", layout="wide")

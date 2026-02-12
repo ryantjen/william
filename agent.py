@@ -2,12 +2,11 @@
 #to run agent in streamlit: streamlit run app.py and CTRL + C to close
 # .venv\Scripts\activate to activate virtual environment in terminal (Windows)
 
+import json
 from openai import OpenAI
 from config import OPENAI_API_KEY, MODEL_NAME
-from memory import retrieve_memory, store_memory
+from memory import retrieve_memory, store_memory, retrieve_hybrid_memory
 from tools import run_python
-from memory import retrieve_hybrid_memory
-import json
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -176,8 +175,7 @@ def should_store_simulation(task: str, code: str, output: str, project: str):
         ]
     )
 
-    import json
     try:
         return json.loads(resp.choices[0].message.content)
-    except:
+    except Exception:
         return {"store": False}
