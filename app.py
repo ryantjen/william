@@ -23,7 +23,7 @@ def convert_latex_for_streamlit(text: str) -> str:
 
 from storage import (
     load_projects, save_projects, get_project_names, get_project_goal, set_project_goal,
-    load_chat, save_chat,
+    load_chat, save_chat, delete_chat,
     load_ingested, save_ingested
 )
 
@@ -112,8 +112,8 @@ with st.sidebar.expander("🗑️ Delete project", expanded=False):
                 projects = [p for p in projects if p["name"] != project_to_delete]
                 save_projects(projects)
                 
-                # Clear chat history file
-                save_chat(project_to_delete, [])
+                # Delete chat history file
+                delete_chat(project_to_delete)
                 
                 # Switch to another project
                 new_names = get_project_names(projects)
@@ -154,8 +154,8 @@ with st.sidebar.expander("🔀 Merge projects", expanded=False):
             projects = [p for p in projects if p["name"] != source_project]
             save_projects(projects)
             
-            # Clear source chat history
-            save_chat(source_project, [])
+            # Delete source chat history file
+            delete_chat(source_project)
             
             # Switch to target if we were on source
             if st.session_state.active_project == source_project:

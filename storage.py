@@ -88,6 +88,15 @@ def save_chat(project: str, messages: List[Dict[str, Any]]) -> None:
     p.write_text(json.dumps(messages, indent=2))
 
 
+def delete_chat(project: str) -> bool:
+    """Delete the chat history file for a project. Returns True if deleted."""
+    p = chat_path(project)
+    if p.exists():
+        p.unlink()
+        return True
+    return False
+
+
 INGESTED_FILE = DATA_DIR / "ingested_files.json"
 
 def load_ingested() -> dict:
