@@ -24,6 +24,34 @@ def _make_id(text: str, project: Optional[str], salt: str) -> str:
     base = f"{project or ''}|{salt}|{text}".encode("utf-8", errors="ignore")
     return hashlib.sha256(base).hexdigest()
 
+def is_duplicate(text: str, project: str | None = None, similarity_threshold: float = 0.85) -> bool:
+    """
+    Check if a similar memory already exists using semantic similarity.
+    Returns True if a duplicate is found (similarity > threshold).
+    """
+    try:
+        # Query for the most similar existing memory
+        results = collection.query(
+            query_texts=[text],
+            n_results=1,
+            where={"project": project} if project else None,
+            include=["distances"]
+        )
+        
+        # ChromaDB returns distances (lower = more similar for cosine)
+        # Distance of 0 = identical, distance of 2 = opposite
+        # Convert to similarity: similarity = 1 - (distance / 2)
+        distances = results.get("distances", [[]])
+        if distances and distances[0]:
+            distance = distances[0][0]
+            similarity = 1 - (distance / 2)
+            return similarity >= similarity_threshold
+        
+        return False
+    except Exception:
+        # If check fails, assume not duplicate (safer to store than lose)
+        return False
+
 def store_memory(text: str, metadata: dict | None = None, project: str | None = None) -> str:
     """
     Store one memory and return its id.
@@ -41,6 +69,15 @@ def store_memory(text: str, metadata: dict | None = None, project: str | None = 
         ids=[mem_id]
     )
     return mem_id
+
+def store_memory_if_unique(text: str, metadata: dict | None = None, project: str | None = None, similarity_threshold: float = 0.85) -> str | None:
+    """
+    Store a memory only if a similar one doesn't already exist.
+    Returns the memory id if stored, None if duplicate was found.
+    """
+    if is_duplicate(text, project=project, similarity_threshold=similarity_threshold):
+        return None
+    return store_memory(text, metadata, project)
 
 def store_memories(texts: List[str], metadatas: List[dict], project: str | None = None) -> List[str]:
     """
@@ -64,6 +101,34 @@ def store_memories(texts: List[str], metadatas: List[dict], project: str | None 
 
     collection.add(documents=texts, metadatas=final_metas, ids=ids)
     return ids
+
+def store_memories_if_unique(texts: List[str], metadatas: List[dict], project: str | None = None, similarity_threshold: float = 0.85) -> tuple[List[str], int]:
+    """
+    Batch store memories, skipping duplicates.
+    Returns (list of ids stored, count of duplicates skipped).
+    """
+    if not texts:
+        return [], 0
+
+    ids_stored = []
+    duplicates_skipped = 0
+    now = int(time.time())
+
+    for i, (t, md) in enumerate(zip(texts, metadatas)):
+        if is_duplicate(t, project=project, similarity_threshold=similarity_threshold):
+            duplicates_skipped += 1
+            continue
+        
+        m = dict(md or {})
+        if project:
+            m["project"] = project
+        m.setdefault("created_at", now)
+        mid = _make_id(t, project, salt=f"{now}:{i}")
+        
+        collection.add(documents=[t], metadatas=[m], ids=[mid])
+        ids_stored.append(mid)
+
+    return ids_stored, duplicates_skipped
 
 def retrieve_memory(query: str, project: str | None = None, n_results: int = 4):
     """
@@ -102,13 +167,22 @@ def list_memories(
     Fetch memories with optional metadata filters. Returns list of dicts:
     {id, text, metadata}
     """
-    where = {}
+    # Build where clause - use $and for multiple conditions
+    conditions = []
     if project:
-        where["project"] = project
+        conditions.append({"project": {"$eq": project}})
     if where_extra:
-        where.update(where_extra)
+        for k, v in where_extra.items():
+            conditions.append({k: {"$eq": v}})
+    
+    if len(conditions) == 0:
+        where = None
+    elif len(conditions) == 1:
+        where = conditions[0]
+    else:
+        where = {"$and": conditions}
 
-    res = collection.get(where=where if where else None, include=["documents", "metadatas"])
+    res = collection.get(where=where, include=["documents", "metadatas"])
 
     items = []
     ids = res.get("ids", [])
@@ -126,10 +200,20 @@ def delete_memory(mem_id: str):
     collection.delete(ids=[mem_id])
 
 def count_memories(project: str | None = None, where_extra: dict | None = None) -> int:
-    where = {}
+    # Build where clause - use $and for multiple conditions
+    conditions = []
     if project:
-        where["project"] = project
+        conditions.append({"project": {"$eq": project}})
     if where_extra:
-        where.update(where_extra)
-    res = collection.get(where=where if where else None, include=[])
+        for k, v in where_extra.items():
+            conditions.append({k: {"$eq": v}})
+    
+    if len(conditions) == 0:
+        where = None
+    elif len(conditions) == 1:
+        where = conditions[0]
+    else:
+        where = {"$and": conditions}
+    
+    res = collection.get(where=where, include=[])
     return len(res.get("ids", []))

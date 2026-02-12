@@ -4,7 +4,7 @@ import time
 import streamlit as st
 import pandas as pd
 
-from agent import ask_agent, execute_natural_language
+from agent import ask_agent, execute_natural_language, extract_memories_from_exchange, extract_memories_from_text
 from tools import run_python
 
 
@@ -28,7 +28,7 @@ from storage import (
 )
 
 from memory import (
-    store_memory, store_memories,
+    store_memory, store_memories, store_memories_if_unique,
     list_memories, delete_memory, count_memories
 )
 
@@ -76,7 +76,7 @@ if st.sidebar.button("Clear chat for this project"):
     st.rerun()
 
 # ---------- Tabs ----------
-tab_chat, tab_files, tab_memory = st.tabs(["💬 Chat", "📁 Files", "🧠 Memory Dashboard"])
+tab_chat, tab_files, tab_add_memory, tab_memory = st.tabs(["💬 Chat", "📁 Files", "➕ Add Memory", "🧠 Memory Dashboard"])
 
 # ---------- Load chat for active project ----------
 if "chat" not in st.session_state or st.session_state.get("chat_project") != active_project:
@@ -89,20 +89,30 @@ if "chat" not in st.session_state or st.session_state.get("chat_project") != act
 with tab_chat:
     st.subheader(f"Chat — {active_project}")
 
-    # Render chat history + Pin button for assistant messages
+    # Render chat history + Save to Memory button for assistant messages
     for i, msg in enumerate(st.session_state.chat):
         with st.chat_message(msg["role"]):
             st.markdown(convert_latex_for_streamlit(msg["content"]))
 
             if msg["role"] == "assistant":
-                # Pin this assistant message as a core memory
-                if st.button("📌 Pin as core memory", key=f"pin_{active_project}_{i}"):
-                    store_memory(
-                        text=msg["content"],
-                        metadata={"type": "core", "pinned": True, "source": "chat_pin"},
-                        project=active_project
-                    )
-                    st.success("Pinned to core memory.")
+                # Find the preceding user message for this exchange
+                user_input = ""
+                if i > 0 and st.session_state.chat[i-1]["role"] == "user":
+                    user_input = st.session_state.chat[i-1]["content"]
+                
+                col1, col2 = st.columns([1, 5])
+                with col1:
+                    if st.button("💾 Save to Memory", key=f"save_mem_{active_project}_{i}"):
+                        with st.spinner("Extracting memories..."):
+                            count = extract_memories_from_exchange(
+                                user_input=user_input,
+                                answer=msg["content"],
+                                project=active_project
+                            )
+                        if count > 0:
+                            st.success(f"Saved {count} memory(s).")
+                        else:
+                            st.info("No new memories extracted (may be duplicates or trivial).")
 
     # Display any pending figures from run:/nlrun: (saved before rerun)
     if st.session_state.get("pending_figs"):
@@ -177,7 +187,9 @@ with tab_chat:
 
             # 3) Normal chat
             else:
-                response_for_history = ask_agent(user_text, project=active_project)
+                # Pass chat history for context (exclude the just-added user message)
+                history_for_context = st.session_state.chat[:-1]
+                response_for_history = ask_agent(user_text, project=active_project, chat_history=history_for_context)
                 st.markdown(convert_latex_for_streamlit(response_for_history))
 
         # Save assistant message
@@ -218,16 +230,17 @@ with tab_files:
                     name = uploaded.name
                     lower = name.lower()
                     n_chunks = 0
+                    n_duplicates = 0
 
                     if lower.endswith(".txt"):
                         chunks, metas = ingest_txt(data, name)
-                        store_memories(chunks, metas, project=target_project)
-                        n_chunks = len(chunks)
+                        ids_stored, n_duplicates = store_memories_if_unique(chunks, metas, project=target_project)
+                        n_chunks = len(ids_stored)
 
                     elif lower.endswith(".csv"):
                         chunks, metas, df = ingest_csv(data, name)
-                        store_memories(chunks, metas, project=target_project)
-                        n_chunks = len(chunks)
+                        ids_stored, n_duplicates = store_memories_if_unique(chunks, metas, project=target_project)
+                        n_chunks = len(ids_stored)
                         st.dataframe(df.head(20))
 
                     elif lower.endswith(".pdf"):
@@ -235,9 +248,10 @@ with tab_files:
                         if pages_with_text == 0:
                             st.warning("No extractable text found. This PDF may be scanned or image-based.")
                         else:
-                            store_memories(chunks, metas, project=target_project)
-                            n_chunks = len(chunks)
-                            st.success(f"Ingested PDF: {pages_with_text} pages with text, {n_chunks} chunks.")
+                            ids_stored, n_duplicates = store_memories_if_unique(chunks, metas, project=target_project)
+                            n_chunks = len(ids_stored)
+                            dup_msg = f" ({n_duplicates} duplicates skipped)" if n_duplicates > 0 else ""
+                            st.success(f"Ingested PDF: {pages_with_text} pages with text, {n_chunks} chunks stored{dup_msg}.")
 
                     else:
                         st.error("Unsupported file type.")
@@ -248,12 +262,15 @@ with tab_files:
                         "name": name,
                         "ts": int(time.time()),
                         "chunks": n_chunks,
+                        "duplicates_skipped": n_duplicates,
                         "stored_as": "global" if store_as_global else "project"
                     }
                     save_ingested(ingested)
 
-                    if n_chunks > 0:
-                        st.success(f"Ingested {name}: {n_chunks} chunks saved.")
+                    # Show success message for non-PDF files (PDF has its own message above)
+                    if n_chunks > 0 and not lower.endswith(".pdf"):
+                        dup_msg = f" ({n_duplicates} duplicates skipped)" if n_duplicates > 0 else ""
+                        st.success(f"Ingested {name}: {n_chunks} chunks saved{dup_msg}.")
 
             except Exception as e:
                 st.error("Ingestion failed.")
@@ -264,6 +281,48 @@ with tab_files:
         st.json(ingested[active_project])
     else:
         st.info("No files ingested yet for this project.")
+
+# =========================
+# TAB: ADD MEMORY
+# =========================
+with tab_add_memory:
+    st.subheader("Add Memory from Text")
+    st.caption("Paste notes, formulas, excerpts, or any content. The agent will extract and store relevant memories.")
+
+    # Project selection
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        store_to_options = [active_project, "(Global - all projects)"]
+        store_to = st.selectbox("Store memories to:", store_to_options)
+    
+    target_project = None if store_to == "(Global - all projects)" else active_project
+
+    # Text input
+    input_text = st.text_area(
+        "Text to extract memories from:",
+        height=300,
+        placeholder="Paste your notes, formulas, theorems, or any content here...\n\nExample:\nThe Central Limit Theorem states that for a random sample of n observations from any population with mean μ and variance σ², the sampling distribution of the sample mean approaches a normal distribution as n → ∞."
+    )
+
+    # Extract button
+    if st.button("🧠 Extract & Store Memories", type="primary", disabled=not input_text.strip()):
+        with st.spinner("Analyzing text and extracting memories..."):
+            count = extract_memories_from_text(input_text.strip(), project=target_project)
+        
+        if count > 0:
+            st.success(f"Successfully extracted and stored {count} memory(s)!")
+            st.balloons()
+        else:
+            st.warning("No memories extracted. The text may not contain notable information, or similar memories already exist.")
+
+    st.divider()
+    st.markdown("### Tips for best results")
+    st.markdown("""
+    - **Formulas**: Include the formula name and the equation. Use standard notation.
+    - **Theorems**: State the theorem name, conditions, and conclusion.
+    - **Insights**: Be specific about what you learned and why it matters.
+    - **References**: Include author, title, and key points.
+    """)
 
 # =========================
 # TAB: MEMORY DASHBOARD
@@ -277,7 +336,7 @@ with tab_memory:
     with colB:
         mem_type = st.selectbox(
             "Type filter",
-            ["(all)", "core", "pdf_chunk", "txt_chunk", "csv_chunk", "simulation", "interaction", "code_run", "theorem", "insight", "assumption", "decision", "result", "reference"]
+            ["(all)", "user_preference", "agent_trait", "pdf_chunk", "txt_chunk", "csv_chunk", "simulation", "theorem", "insight", "assumption", "decision", "result", "reference", "formula", "methodology"]
         )
     with colC:
         date_filter = st.selectbox(
