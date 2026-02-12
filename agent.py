@@ -11,7 +11,7 @@ from tools import run_python
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = """
-You are a Statistical Research Copilot.
+You are a Statistical Research Copilot named William.
 
 You help with:
 - mathematical proofs
@@ -47,34 +47,56 @@ def build_personality_prompt(user_prefs: list, agent_traits: list) -> str:
     
     return "\n\n".join(sections)
 
-def ask_agent(user_input: str, project: str, chat_history: list = None):
-    # Retrieve project + global memories for context
-    memories = retrieve_hybrid_memory(user_input, project=project, n_project=8, n_global=2)
-    memory_block = "\n\n".join(f"- {m}" for m in memories) if memories else "- (none)"
+def ask_agent(user_input: str, project: str, chat_history: list = None, project_goal: str = None):
+    """
+    Context hierarchy (highest to lowest priority):
+    1. System prompt + Project goal
+    2. Chat history (recent conversation)
+    3. Project memories (specific to current project)
+    4. Global memories (cross-project knowledge)
+    5. Personality context (communication style)
+    """
+    # Retrieve memories separately for clear hierarchy
+    project_memories = retrieve_memory(user_input, project=project, n_results=8)
+    global_memories = retrieve_memory(user_input, project=None, n_results=4)
+    
+    # De-duplicate global (remove any that appear in project)
+    project_set = set(project_memories)
+    global_memories = [m for m in global_memories if m not in project_set]
+    
+    project_block = "\n".join(f"- {m}" for m in project_memories) if project_memories else "- (none)"
+    global_block = "\n".join(f"- {m}" for m in global_memories) if global_memories else "- (none)"
 
     # Retrieve personality context (global preferences and traits)
     user_prefs = retrieve_memory("user preferences communication style learning", project=None, n_results=3)
     agent_traits = retrieve_memory("agent personality traits approach style", project=None, n_results=3)
     personality_block = build_personality_prompt(user_prefs, agent_traits)
 
-    # Build messages with personality context
+    # Build messages in priority order
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
     
-    # Add personality context if we have any
-    if personality_block:
-        messages.append({"role": "system", "content": personality_block})
+    # 1. Project goal (highest context priority)
+    if project_goal:
+        messages.append({"role": "system", "content": f"Current project: {project}\nProject goal: {project_goal}\n\nTailor your responses to help achieve this goal."})
     
-    # Add memory block
-    messages.append({"role": "system", "content": f"Relevant memory (project='{project}' prioritized):\n{memory_block}"})
-    
-    # Add recent chat history for conversation context
+    # 2. Chat history (recent conversation context)
     if chat_history:
         # Limit to last 10 messages (5 exchanges) to avoid token overflow
         recent_history = chat_history[-10:]
         for msg in recent_history:
             messages.append({"role": msg["role"], "content": msg["content"]})
+    
+    # 3. Project memories (specific to this project)
+    messages.append({"role": "system", "content": f"Project memories ('{project}'):\n{project_block}"})
+    
+    # 4. Global memories (cross-project knowledge)
+    messages.append({"role": "system", "content": f"Global memories:\n{global_block}"})
+    
+    # 5. Personality context (communication style - lowest priority)
+    if personality_block:
+        messages.append({"role": "system", "content": personality_block})
     
     # Add current user input
     messages.append({"role": "user", "content": user_input})
@@ -148,7 +170,10 @@ def should_store_memory(user_input: str, answer: str, project: str):
     Assistant: {answer}
 
     Extract ALL distinct pieces of knowledge worth remembering:
-    - Theorems, definitions, formulas
+    - Definitions (formal definitions of terms/concepts)
+    - Theorems and formulas
+    - Functions (reusable code functions worth saving)
+    - Examples (worked examples, illustrations of concepts)
     - Insights and key observations
     - Assumptions made
     - Decisions or conclusions
@@ -161,22 +186,25 @@ def should_store_memory(user_input: str, answer: str, project: str):
     - Duplicates of the same concept
 
     Return JSON with a "memories" array. Each memory should have:
-    - name (a short descriptive title, e.g. "Central Limit Theorem", "Bayes' Rule", "Sample Size Decision")
-    - type (one of: theorem, insight, assumption, decision, result, reference, formula)
+    - name (a short descriptive title, e.g. "Central Limit Theorem", "bootstrap_ci", "CLT Example")
+    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
     - importance (1-5)
     - text (the full content - see formatting rules below)
 
     **FORMATTING RULES for text field:**
     - For formulas/equations: Put the formula name first, then use $$...$$ for the main equation on its own line
     - Use $...$ only for inline math within sentences
-    - Keep explanations clear and separate from the formula
+    - For examples: Clearly label as "Example:" and show the worked solution
+    - For definitions: Start with the term being defined in bold
+    - For functions: Use function name as title, include docstring description, wrap code in ```python blocks
 
     If nothing is worth storing, return {{"memories": []}}
 
     Example response:
     {{"memories": [
-        {{"name": "Central Limit Theorem", "type": "theorem", "importance": 5, "text": "**Central Limit Theorem**\\n\\nFor a sample of size $n$ from a population with mean $\\\\mu$ and variance $\\\\sigma^2$, the sampling distribution of the sample mean approaches normal as $n \\\\to \\\\infty$:\\n\\n$$\\\\bar{{X}} \\\\sim N\\\\left(\\\\mu, \\\\frac{{\\\\sigma^2}}{{n}}\\\\right)$$"}},
-        {{"name": "CLT Sample Size Rule", "type": "insight", "importance": 3, "text": "**CLT Sample Size Rule**\\n\\nThe Central Limit Theorem approximation is generally reliable when $n \\\\geq 30$ for most practical applications."}}
+        {{"name": "Random Variable Definition", "type": "definition", "importance": 4, "text": "**Random Variable**\\n\\nA random variable is a function that maps outcomes from a sample space to real numbers. Denoted as $X: \\\\Omega \\\\to \\\\mathbb{{R}}$."}},
+        {{"name": "bootstrap_ci", "type": "function", "importance": 4, "text": "**bootstrap_ci**\\n\\nComputes bootstrap confidence interval for a dataset.\\n\\n```python\\ndef bootstrap_ci(data, n_boot=1000, alpha=0.05):\\n    import numpy as np\\n    samples = [np.mean(np.random.choice(data, len(data))) for _ in range(n_boot)]\\n    return np.percentile(samples, [100*alpha/2, 100*(1-alpha/2)])\\n```"}},
+        {{"name": "CLT Example - Dice", "type": "example", "importance": 3, "text": "**Example: CLT with Dice**\\n\\nRolling a fair die 100 times: $\\\\mu = 3.5$, $\\\\sigma^2 = 35/12$.\\n\\nBy CLT, $\\\\bar{{X}} \\\\sim N(3.5, 35/1200) = N(3.5, 0.029)$"}}
     ]}}
     """
 
@@ -216,9 +244,11 @@ def should_store_simulation(task: str, code: str, output: str, project: str):
     Extract ALL distinct pieces of knowledge worth remembering:
     - Meaningful statistical results or findings
     - Useful methodology or code patterns
+    - Reusable functions from the code
     - Key insights from the output
     - Decisions based on the results
     - Any formulas or equations discovered/used
+    - Examples that could be useful later
 
     Do NOT store:
     - Trivial calculations or simple arithmetic
@@ -226,15 +256,16 @@ def should_store_simulation(task: str, code: str, output: str, project: str):
     - Redundant or duplicate information
 
     Return JSON with a "memories" array. Each memory should have:
-    - name (a short descriptive title, e.g. "Monte Carlo Pi Estimate", "Bootstrap Confidence Interval")
-    - type (one of: result, methodology, insight, decision, formula)
+    - name (a short descriptive title, e.g. "Monte Carlo Pi Estimate", "bootstrap_ci", "Bootstrap CI Example")
+    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
     - importance (1-5)
     - text (the full content - see formatting rules below)
 
     **FORMATTING RULES for text field:**
     - For formulas/equations: Put the formula name first, then use $$...$$ for the main equation on its own line
     - Use $...$ only for inline math within sentences
-    - Keep explanations clear and separate from the formula
+    - For examples: Clearly label as "Example:" and show the worked solution
+    - For functions: Use function name as title, include brief description, wrap code in ```python blocks
 
     If nothing is worth storing, return {{"memories": []}}
     """
@@ -378,7 +409,10 @@ def extract_memories_from_text(text: str, project: str | None) -> int:
     {text}
 
     Extract ALL distinct pieces of knowledge worth remembering:
-    - Theorems, definitions, formulas
+    - Definitions (formal definitions of terms/concepts)
+    - Theorems and formulas
+    - Functions (reusable code functions)
+    - Examples (worked examples, illustrations of concepts)
     - Insights and key observations
     - Assumptions or conditions
     - Important results or findings
@@ -391,15 +425,17 @@ def extract_memories_from_text(text: str, project: str | None) -> int:
     - Trivial or obvious information
 
     Return JSON with a "memories" array. Each memory should have:
-    - name (a short descriptive title, e.g. "Central Limit Theorem", "Bayes' Rule")
-    - type (one of: theorem, insight, assumption, decision, result, reference, formula, methodology)
+    - name (a short descriptive title, e.g. "Central Limit Theorem", "bootstrap_ci", "CLT Example")
+    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
     - importance (1-5)
     - text (the full content - see formatting rules below)
 
     **FORMATTING RULES for text field:**
     - For formulas/equations: Put the formula name first, then use $$...$$ for the main equation on its own line
     - Use $...$ only for inline math within sentences
-    - Keep explanations clear and separate from the formula
+    - For examples: Clearly label as "Example:" and show the worked solution
+    - For definitions: Start with the term being defined in bold
+    - For functions: Use function name as title, include brief description, wrap code in ```python blocks
 
     If nothing is worth storing, return {{"memories": []}}
     """

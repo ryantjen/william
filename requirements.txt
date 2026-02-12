@@ -7,3 +7,5 @@ numpy
 pandas
 matplotlib
 pypdf
+umap-learn
+plotly

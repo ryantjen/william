@@ -199,6 +199,90 @@ def list_memories(
 def delete_memory(mem_id: str):
     collection.delete(ids=[mem_id])
 
+def update_memory(mem_id: str, new_text: str, new_metadata: dict = None) -> bool:
+    """
+    Update an existing memory's text and optionally metadata.
+    ChromaDB doesn't support direct updates, so we delete and re-add.
+    Returns True if successful, False if memory not found.
+    """
+    # Get existing memory
+    res = collection.get(ids=[mem_id], include=["metadatas"])
+    if not res.get("ids"):
+        return False
+    
+    old_meta = res["metadatas"][0] if res.get("metadatas") else {}
+    
+    # Merge metadata (keep old values, update with new)
+    final_meta = dict(old_meta)
+    if new_metadata:
+        final_meta.update(new_metadata)
+    final_meta["last_edited"] = int(time.time())
+    
+    # Delete old and add new (keeps same ID)
+    collection.delete(ids=[mem_id])
+    collection.add(
+        documents=[new_text],
+        metadatas=[final_meta],
+        ids=[mem_id]
+    )
+    return True
+
+def get_memory_by_id(mem_id: str) -> Dict[str, Any] | None:
+    """Get a single memory by its ID."""
+    res = collection.get(ids=[mem_id], include=["documents", "metadatas"])
+    if not res.get("ids"):
+        return None
+    return {
+        "id": res["ids"][0],
+        "text": res["documents"][0] if res.get("documents") else "",
+        "metadata": res["metadatas"][0] if res.get("metadatas") else {}
+    }
+
+def delete_project_memories(project: str) -> int:
+    """
+    Delete all memories for a specific project.
+    Returns count of memories deleted.
+    """
+    where = {"project": {"$eq": project}}
+    res = collection.get(where=where, include=[])
+    ids = res.get("ids", [])
+    
+    if ids:
+        collection.delete(ids=ids)
+    
+    return len(ids)
+
+def merge_projects(source_project: str, target_project: str) -> int:
+    """
+    Merge all memories from source_project into target_project.
+    Updates the project metadata field. Returns count of memories merged.
+    """
+    where = {"project": {"$eq": source_project}}
+    res = collection.get(where=where, include=["documents", "metadatas"])
+    
+    ids = res.get("ids", [])
+    docs = res.get("documents", [])
+    metas = res.get("metadatas", [])
+    
+    if not ids:
+        return 0
+    
+    # Update each memory's project tag
+    for i, (mid, doc, md) in enumerate(zip(ids, docs, metas)):
+        new_meta = dict(md or {})
+        new_meta["project"] = target_project
+        new_meta["merged_from"] = source_project  # Track merge history
+        
+        # ChromaDB doesn't support direct metadata updates, so we delete and re-add
+        collection.delete(ids=[mid])
+        collection.add(
+            documents=[doc],
+            metadatas=[new_meta],
+            ids=[mid]
+        )
+    
+    return len(ids)
+
 def count_memories(project: str | None = None, where_extra: dict | None = None) -> int:
     # Build where clause - use $and for multiple conditions
     conditions = []
@@ -217,3 +301,22 @@ def count_memories(project: str | None = None, where_extra: dict | None = None) 
     
     res = collection.get(where=where, include=[])
     return len(res.get("ids", []))
+
+def get_all_embeddings(project: str | None = None) -> Dict[str, Any]:
+    """
+    Fetch all memories with their embeddings for visualization.
+    Returns dict with: ids, texts, metadatas, embeddings
+    """
+    where = {"project": {"$eq": project}} if project else None
+    
+    res = collection.get(
+        where=where,
+        include=["documents", "metadatas", "embeddings"]
+    )
+    
+    return {
+        "ids": res.get("ids", []),
+        "texts": res.get("documents", []),
+        "metadatas": res.get("metadatas", []),
+        "embeddings": res.get("embeddings", [])
+    }
