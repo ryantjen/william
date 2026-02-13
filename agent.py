@@ -1,16 +1,14 @@
-#to run agent in terminal: python main.py
-#to run agent in streamlit: streamlit run app.py and CTRL + C to close
-# .venv\Scripts\activate to activate virtual environment in terminal (Windows)
+# Run the app: streamlit run app.py (use run_agent.bat / run_agent.sh, or CTRL+C to close)
 
 import json
 import re
 import time
 import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 from config import OPENAI_API_KEY, MODEL_NAME
-from memory import retrieve_memory, retrieve_memory_with_metadata, store_memory, store_memory_if_unique, retrieve_hybrid_memory, list_memories, delete_memory
+from memory import retrieve_memory_with_metadata, store_memory, store_memory_if_unique, list_memories, delete_memory
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -267,7 +265,6 @@ def _chat_completion_with_retry(messages: list, max_retries: int = 2):
                 time.sleep(2 ** attempt)
                 continue
             raise last_error
-    raise last_error
 
 
 def store_simulation_memories(task: str, code: str, output: str, project: str) -> None:

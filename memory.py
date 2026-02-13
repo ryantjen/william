@@ -24,6 +24,22 @@ def _make_id(text: str, project: Optional[str], salt: str) -> str:
     base = f"{project or ''}|{salt}|{text}".encode("utf-8", errors="ignore")
     return hashlib.sha256(base).hexdigest()
 
+
+def _build_where(project: Optional[str], where_extra: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Build ChromaDB where clause from project and extra metadata filters."""
+    conditions = []
+    if project:
+        conditions.append({"project": {"$eq": project}})
+    if where_extra:
+        for k, v in where_extra.items():
+            conditions.append({k: {"$eq": v}})
+    if not conditions:
+        return None
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
+
+
 def is_duplicate(text: str, project: str | None = None, similarity_threshold: float = 0.85) -> bool:
     """
     Check if a similar memory already exists using semantic similarity.
@@ -215,21 +231,7 @@ def list_memories(
         items.sort(key=lambda x: x["metadata"].get("created_at", 0), reverse=True)
         return items[:limit]
 
-    # Build where clause - use $and for multiple conditions
-    conditions = []
-    if project:
-        conditions.append({"project": {"$eq": project}})
-    if where_extra:
-        for k, v in where_extra.items():
-            conditions.append({k: {"$eq": v}})
-
-    if len(conditions) == 0:
-        where = None
-    elif len(conditions) == 1:
-        where = conditions[0]
-    else:
-        where = {"$and": conditions}
-
+    where = _build_where(project, where_extra)
     res = collection.get(where=where, include=["documents", "metadatas"])
 
     items = []
@@ -355,21 +357,7 @@ def count_memories(project: str | None = None, where_extra: dict | None = None, 
                 items = [m for m in items if m.get(k) == v]
         return len(items)
 
-    # Build where clause - use $and for multiple conditions
-    conditions = []
-    if project:
-        conditions.append({"project": {"$eq": project}})
-    if where_extra:
-        for k, v in where_extra.items():
-            conditions.append({k: {"$eq": v}})
-
-    if len(conditions) == 0:
-        where = None
-    elif len(conditions) == 1:
-        where = conditions[0]
-    else:
-        where = {"$and": conditions}
-
+    where = _build_where(project, where_extra)
     res = collection.get(where=where, include=[])
     return len(res.get("ids", []))
 
