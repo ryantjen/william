@@ -1,10 +1,11 @@
 # app.py
 import re
 import time
+import json
 import streamlit as st
 import pandas as pd
 
-from agent import ask_agent, execute_natural_language, extract_memories_from_exchange, extract_memories_from_text
+from agent import ask_agent, execute_natural_language, extract_memories_from_exchange, extract_memories_from_text, summarize_conversation, search_papers, format_paper_results
 from tools import run_python
 
 
@@ -24,11 +25,11 @@ def convert_latex_for_streamlit(text: str) -> str:
 from storage import (
     load_projects, save_projects, get_project_names, get_project_goal, set_project_goal,
     load_chat, save_chat, delete_chat,
-    load_ingested, save_ingested
+    load_ingested, save_ingested, clear_ingested_for_project, clear_ingested_file
 )
 
 from memory import (
-    store_memory, store_memories, store_memories_if_unique,
+    store_memory, store_memories, store_memory_if_unique, store_memories_if_unique,
     list_memories, delete_memory, update_memory, get_memory_by_id,
     delete_project_memories, merge_projects,
     count_memories, get_all_embeddings
@@ -115,6 +116,9 @@ with st.sidebar.expander("🗑️ Delete project", expanded=False):
                 # Delete chat history file
                 delete_chat(project_to_delete)
                 
+                # Clear ingestion records for this project
+                clear_ingested_for_project(project_to_delete)
+                
                 # Switch to another project
                 new_names = get_project_names(projects)
                 st.session_state.active_project = new_names[0] if new_names else "General"
@@ -166,14 +170,85 @@ with st.sidebar.expander("🔀 Merge projects", expanded=False):
 
 st.sidebar.caption("Project name is used as the `project` tag in memory metadata.")
 
-if st.sidebar.button("Clear chat for this project"):
-    save_chat(active_project, [])
-    st.session_state.chat = []
-    st.success("Cleared chat UI history for this project.")
-    st.rerun()
+col_clear, col_summary = st.sidebar.columns(2)
+with col_clear:
+    if st.button("🗑️ Clear chat"):
+        save_chat(active_project, [])
+        st.session_state.chat = []
+        st.success("Cleared chat.")
+        st.rerun()
+
+with col_summary:
+    if st.button("📝 Summarize"):
+        if st.session_state.get("chat") and len(st.session_state.chat) >= 2:
+            with st.spinner("Summarizing conversation..."):
+                summary = summarize_conversation(st.session_state.chat, active_project)
+            if summary:
+                st.success("Summary saved to memory!")
+            else:
+                st.warning("Could not generate summary.")
+        else:
+            st.info("Need at least one exchange to summarize.")
+
+# Chat export options
+with st.sidebar.expander("📤 Export chat", expanded=False):
+    if st.session_state.get("chat") and len(st.session_state.chat) > 0:
+        chat_data = st.session_state.chat
+        
+        # Markdown export
+        chat_md = f"# Chat Export — {active_project}\n"
+        chat_md += f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n"
+        for msg in chat_data:
+            role = "**User:**" if msg["role"] == "user" else "**Assistant:**"
+            chat_md += f"{role}\n\n{msg['content']}\n\n---\n\n"
+        
+        st.download_button(
+            "📥 Markdown",
+            data=chat_md,
+            file_name=f"chat_{active_project}_{int(time.time())}.md",
+            mime="text/markdown",
+            key="export_chat_md"
+        )
+        
+        # LaTeX export
+        chat_latex = [
+            r"\documentclass{article}",
+            r"\usepackage{amsmath,amssymb}",
+            r"\usepackage[margin=1in]{geometry}",
+            r"\usepackage{listings}",
+            r"\lstset{basicstyle=\ttfamily\small,breaklines=true}",
+            r"",
+            r"\title{Chat Export — " + active_project + r"}",
+            r"\date{" + time.strftime('%Y-%m-%d') + r"}",
+            r"\begin{document}",
+            r"\maketitle",
+            r"",
+        ]
+        for msg in chat_data:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            chat_latex.append(r"\subsection*{" + role + r"}")
+            content = msg["content"]
+            # Basic conversions
+            content = re.sub(r'\*\*(.+?)\*\*', r'\\textbf{\1}', content)
+            content = re.sub(r'```python\n(.*?)\n```', r'\\begin{lstlisting}[language=Python]\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
+            content = re.sub(r'```\n?(.*?)\n?```', r'\\begin{lstlisting}\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
+            chat_latex.append(content)
+            chat_latex.append(r"\hrulefill")
+            chat_latex.append("")
+        chat_latex.append(r"\end{document}")
+        
+        st.download_button(
+            "📥 LaTeX",
+            data="\n".join(chat_latex),
+            file_name=f"chat_{active_project}_{int(time.time())}.tex",
+            mime="text/x-tex",
+            key="export_chat_tex"
+        )
+    else:
+        st.caption("No chat history to export.")
 
 # ---------- Tabs ----------
-tab_chat, tab_files, tab_add_memory, tab_memory, tab_map = st.tabs(["💬 Chat", "📁 Files", "➕ Add Memory", "🧠 Memory Dashboard", "🗺️ Memory Map"])
+tab_chat, tab_files, tab_add_memory, tab_memory, tab_map, tab_review = st.tabs(["💬 Chat", "📁 Files", "➕ Add Memory", "🧠 Memory Dashboard", "🗺️ Memory Map", "🎯 Review"])
 
 # ---------- Load chat for active project ----------
 if "chat" not in st.session_state or st.session_state.get("chat_project") != active_project:
@@ -219,7 +294,7 @@ with tab_chat:
         # Clear after displaying
         del st.session_state["pending_figs"]
 
-    user_text = st.chat_input("Use 'run:' for Python, 'nlrun:' for natural language → Python.")
+    user_text = st.chat_input("Use 'run:' for Python, 'nlrun:' for NL→code, 'papers:' to search papers.")
 
     if user_text:
         # Save user message
@@ -282,13 +357,51 @@ with tab_chat:
                 # Include code in history so it displays on reload
                 response_for_history = f"**Generated code:**\n```python\n{code}\n```\n\n**Output:**\n```\n{run_out}\n```"
 
-            # 3) Normal chat
+            # 3) Paper search
+            elif user_text.startswith("papers:"):
+                query = user_text[len("papers:"):].strip()
+                
+                with st.spinner(f"Searching papers for: {query}..."):
+                    papers = search_papers(query, limit=5)
+                
+                response_for_history = format_paper_results(papers)
+                st.markdown(response_for_history)
+                
+                # Offer to save paper references to memory
+                if papers and "error" not in papers[0]:
+                    if st.button("💾 Save these references to memory"):
+                        for p in papers:
+                            ref_text = f"**{p['title']}**\n\nAuthors: {p['authors']}\nYear: {p['year']}\nCitations: {p['citations']}\nURL: {p['url']}\n\nAbstract: {p['abstract']}"
+                            store_memory_if_unique(
+                                text=ref_text,
+                                metadata={
+                                    "name": p['title'][:100],
+                                    "type": "reference",
+                                    "importance": 3,
+                                    "source": "paper_search"
+                                },
+                                project=active_project
+                            )
+                        st.success(f"Saved {len(papers)} paper references to memory!")
+
+            # 4) Normal chat
             else:
                 # Pass chat history for context (exclude the just-added user message)
                 history_for_context = st.session_state.chat[:-1]
                 project_goal = get_project_goal(projects, active_project)
-                response_for_history = ask_agent(user_text, project=active_project, chat_history=history_for_context, project_goal=project_goal)
+                response_for_history, citations = ask_agent(user_text, project=active_project, chat_history=history_for_context, project_goal=project_goal)
                 st.markdown(convert_latex_for_streamlit(response_for_history))
+                
+                # Display citations if any
+                if citations:
+                    # Filter to only show memories with actual content
+                    valid_citations = [c for c in citations if c.get("name") or c.get("text")]
+                    if valid_citations:
+                        with st.expander(f"📚 Sources ({len(valid_citations)} memories referenced)", expanded=False):
+                            for c in valid_citations:
+                                name = c.get("name") or c.get("text", "")[:50] + "..."
+                                mtype = c.get("type", "unknown")
+                                st.markdown(f"- **{mtype}**: {name}")
 
         # Save assistant message
         st.session_state.chat.append({"role": "assistant", "content": response_for_history})
@@ -376,7 +489,30 @@ with tab_files:
 
     st.markdown("### Ingested files registry (this project)")
     if ingested.get(active_project):
-        st.json(ingested[active_project])
+        for file_hash, file_info in list(ingested[active_project].items()):
+            file_name = file_info.get("name", "Unknown")
+            chunks = file_info.get("chunks", 0)
+            ts = file_info.get("ts", 0)
+            ts_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)) if ts else "Unknown"
+            
+            with st.expander(f"📄 {file_name} ({chunks} chunks)", expanded=False):
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.caption(f"Ingested: {ts_str}")
+                    st.caption(f"Hash: {file_hash[:16]}...")
+                    st.caption(f"Stored as: {file_info.get('stored_as', 'project')}")
+                with col2:
+                    if st.button("🗑️ Clear record", key=f"clear_ingested_{file_hash}"):
+                        clear_ingested_file(active_project, file_hash)
+                        st.success(f"Cleared record for {file_name}")
+                        st.rerun()
+        
+        # Option to clear all
+        st.markdown("---")
+        if st.button("🗑️ Clear all ingestion records for this project"):
+            cleared = clear_ingested_for_project(active_project)
+            st.success(f"Cleared {cleared} ingestion records.")
+            st.rerun()
     else:
         st.info("No files ingested yet for this project.")
 
@@ -509,6 +645,106 @@ with tab_memory:
         items = [it for it in items if matches(it)]
     
     st.caption(f"Showing {len(items)} memories")
+
+    # Export buttons
+    if items:
+        export_col1, export_col2, export_col3, export_col4 = st.columns([1, 1, 1, 3])
+        with export_col1:
+            # JSON export
+            export_data = []
+            for it in items:
+                export_data.append({
+                    "id": it["id"],
+                    "text": it["text"],
+                    "metadata": it["metadata"]
+                })
+            json_str = json.dumps(export_data, indent=2, default=str)
+            st.download_button(
+                "📥 JSON",
+                data=json_str,
+                file_name=f"memories_{active_project}_{int(time.time())}.json",
+                mime="application/json"
+            )
+        with export_col2:
+            # Markdown export
+            md_lines = [f"# Memories Export — {active_project}\n"]
+            md_lines.append(f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            md_lines.append(f"Total: {len(items)} memories\n\n---\n")
+            
+            for it in items:
+                md = it["metadata"] or {}
+                name = md.get("name", "Untitled")
+                mtype = md.get("type", "unknown")
+                created = md.get("created_at", "")
+                text = it["text"] or ""
+                
+                md_lines.append(f"\n## {name}\n")
+                md_lines.append(f"**Type:** {mtype} | **Created:** {created}\n\n")
+                md_lines.append(f"{text}\n")
+                md_lines.append("\n---\n")
+            
+            markdown_str = "".join(md_lines)
+            st.download_button(
+                "📥 Markdown",
+                data=markdown_str,
+                file_name=f"memories_{active_project}_{int(time.time())}.md",
+                mime="text/markdown"
+            )
+        with export_col3:
+            # LaTeX export
+            def escape_latex(s):
+                """Escape special LaTeX characters except math delimiters."""
+                # Don't escape $ since we use it for math
+                chars = {'&': r'\&', '%': r'\%', '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}'}
+                for old, new in chars.items():
+                    # Avoid escaping inside math mode
+                    s = s.replace(old, new)
+                return s
+            
+            latex_lines = [
+                r"\documentclass{article}",
+                r"\usepackage{amsmath,amssymb,amsthm}",
+                r"\usepackage[margin=1in]{geometry}",
+                r"\usepackage{hyperref}",
+                r"\usepackage{listings}",
+                r"\lstset{basicstyle=\ttfamily\small,breaklines=true}",
+                r"",
+                r"\title{" + f"Memory Export — {active_project}" + r"}",
+                r"\date{" + time.strftime('%Y-%m-%d') + r"}",
+                r"\begin{document}",
+                r"\maketitle",
+                r"",
+            ]
+            
+            for it in items:
+                md = it["metadata"] or {}
+                name = md.get("name", "Untitled")
+                mtype = md.get("type", "unknown")
+                text = it["text"] or ""
+                
+                latex_lines.append(r"\section{" + escape_latex(name) + r"}")
+                latex_lines.append(r"\textbf{Type:} " + escape_latex(mtype) + r"\\[0.5em]")
+                
+                # Convert markdown bold to LaTeX and handle code blocks
+                content = text
+                content = re.sub(r'\*\*(.+?)\*\*', r'\\textbf{\1}', content)
+                content = re.sub(r'```python\n(.*?)\n```', r'\\begin{lstlisting}[language=Python]\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
+                content = re.sub(r'```\n?(.*?)\n?```', r'\\begin{lstlisting}\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
+                
+                latex_lines.append(content)
+                latex_lines.append(r"")
+                latex_lines.append(r"\hrulefill")
+                latex_lines.append(r"")
+            
+            latex_lines.append(r"\end{document}")
+            latex_str = "\n".join(latex_lines)
+            
+            st.download_button(
+                "📥 LaTeX",
+                data=latex_str,
+                file_name=f"memories_{active_project}_{int(time.time())}.tex",
+                mime="text/x-tex"
+            )
 
     if not items:
         st.info("No memories found with current filters.")
@@ -822,3 +1058,130 @@ with tab_map:
             df = pd.DataFrame(st.session_state.map_data)
             type_counts = df["type"].value_counts()
             st.dataframe(type_counts.reset_index().rename(columns={"index": "Type", "type": "Count"}), hide_index=True)
+
+# =========================
+# TAB: REVIEW (Spaced Repetition)
+# =========================
+with tab_review:
+    st.subheader("🎯 Review Mode")
+    st.caption("Test your knowledge with flashcard-style review of your memories.")
+    
+    # Settings
+    col1, col2 = st.columns(2)
+    with col1:
+        review_scope = st.radio("Scope", ["This project only", "All projects"], horizontal=True, key="review_scope")
+    with col2:
+        review_types = st.multiselect(
+            "Memory types to review",
+            ["definition", "theorem", "formula", "function", "example", "insight"],
+            default=["definition", "theorem", "formula"],
+            key="review_types"
+        )
+    
+    # Determine project filter
+    review_project = active_project if review_scope == "This project only" else None
+    
+    # Initialize review state
+    if "review_cards" not in st.session_state:
+        st.session_state.review_cards = []
+    if "review_index" not in st.session_state:
+        st.session_state.review_index = 0
+    if "review_revealed" not in st.session_state:
+        st.session_state.review_revealed = False
+    if "review_stats" not in st.session_state:
+        st.session_state.review_stats = {"correct": 0, "review": 0}
+    
+    # Load/refresh cards button
+    if st.button("🔄 Load Review Cards", type="primary"):
+        # Get memories of selected types
+        all_cards = []
+        for mem_type in review_types:
+            items = list_memories(project=review_project, where_extra={"type": mem_type}, limit=50)
+            all_cards.extend(items)
+        
+        # Shuffle
+        import random
+        random.shuffle(all_cards)
+        
+        st.session_state.review_cards = all_cards
+        st.session_state.review_index = 0
+        st.session_state.review_revealed = False
+        st.session_state.review_stats = {"correct": 0, "review": 0}
+        st.rerun()
+    
+    # Display current card
+    cards = st.session_state.review_cards
+    idx = st.session_state.review_index
+    
+    if cards:
+        st.markdown(f"**Card {idx + 1} of {len(cards)}**")
+        
+        # Progress bar
+        progress = (idx / len(cards)) if len(cards) > 0 else 0
+        st.progress(progress)
+        
+        current_card = cards[idx]
+        md = current_card.get("metadata") or {}
+        name = md.get("name", "Unnamed")
+        mtype = md.get("type", "unknown")
+        text = current_card.get("text", "")
+        
+        # Show the "question" (name/type as prompt)
+        st.markdown(f"### {mtype.title()}: {name}")
+        
+        # Reveal/hide content
+        if st.session_state.review_revealed:
+            st.markdown("---")
+            st.markdown(convert_latex_for_streamlit(text))
+            st.markdown("---")
+            
+            # Feedback buttons
+            col1, col2, col3 = st.columns([1, 1, 2])
+            with col1:
+                if st.button("✅ I knew it", type="primary"):
+                    st.session_state.review_stats["correct"] += 1
+                    st.session_state.review_index += 1
+                    st.session_state.review_revealed = False
+                    if st.session_state.review_index >= len(cards):
+                        st.session_state.review_index = 0  # Loop back
+                    st.rerun()
+            with col2:
+                if st.button("🔁 Review again"):
+                    st.session_state.review_stats["review"] += 1
+                    # Move card to end of deck
+                    card = cards.pop(idx)
+                    cards.append(card)
+                    st.session_state.review_cards = cards
+                    st.session_state.review_revealed = False
+                    st.rerun()
+        else:
+            st.info("Try to recall the content before revealing!")
+            if st.button("👁️ Reveal Answer", type="secondary"):
+                st.session_state.review_revealed = True
+                st.rerun()
+        
+        # Navigation
+        st.markdown("---")
+        nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 2])
+        with nav_col1:
+            if st.button("⬅️ Previous") and idx > 0:
+                st.session_state.review_index -= 1
+                st.session_state.review_revealed = False
+                st.rerun()
+        with nav_col2:
+            if st.button("➡️ Skip") and idx < len(cards) - 1:
+                st.session_state.review_index += 1
+                st.session_state.review_revealed = False
+                st.rerun()
+        
+        # Stats
+        stats = st.session_state.review_stats
+        total_reviewed = stats["correct"] + stats["review"]
+        if total_reviewed > 0:
+            accuracy = (stats["correct"] / total_reviewed) * 100
+            st.sidebar.markdown(f"### Review Stats")
+            st.sidebar.markdown(f"✅ Correct: {stats['correct']}")
+            st.sidebar.markdown(f"🔁 Need review: {stats['review']}")
+            st.sidebar.markdown(f"📊 Accuracy: {accuracy:.0f}%")
+    else:
+        st.info("Click 'Load Review Cards' to start reviewing your memories.")

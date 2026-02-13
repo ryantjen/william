@@ -3,9 +3,10 @@
 # .venv\Scripts\activate to activate virtual environment in terminal (Windows)
 
 import json
+import requests
 from openai import OpenAI
 from config import OPENAI_API_KEY, MODEL_NAME
-from memory import retrieve_memory, store_memory, store_memory_if_unique, retrieve_hybrid_memory
+from memory import retrieve_memory, retrieve_memory_with_metadata, store_memory, store_memory_if_unique, retrieve_hybrid_memory
 from tools import run_python
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -55,17 +56,23 @@ def ask_agent(user_input: str, project: str, chat_history: list = None, project_
     3. Project memories (specific to current project)
     4. Global memories (cross-project knowledge)
     5. Personality context (communication style)
+    
+    Returns: tuple (answer: str, citations: list of memory dicts)
     """
-    # Retrieve memories separately for clear hierarchy
-    project_memories = retrieve_memory(user_input, project=project, n_results=8)
-    global_memories = retrieve_memory(user_input, project=None, n_results=4)
+    # Retrieve memories with metadata for citation tracking
+    project_mems = retrieve_memory_with_metadata(user_input, project=project, n_results=8)
+    global_mems = retrieve_memory_with_metadata(user_input, project=None, n_results=4)
     
-    # De-duplicate global (remove any that appear in project)
-    project_set = set(project_memories)
-    global_memories = [m for m in global_memories if m not in project_set]
+    # De-duplicate global (remove any that appear in project by text)
+    project_texts = set(m["text"] for m in project_mems)
+    global_mems = [m for m in global_mems if m["text"] not in project_texts]
     
-    project_block = "\n".join(f"- {m}" for m in project_memories) if project_memories else "- (none)"
-    global_block = "\n".join(f"- {m}" for m in global_memories) if global_memories else "- (none)"
+    # Build text blocks for prompt
+    project_block = "\n".join(f"- {m['text']}" for m in project_mems) if project_mems else "- (none)"
+    global_block = "\n".join(f"- {m['text']}" for m in global_mems) if global_mems else "- (none)"
+    
+    # Combine all cited memories (excluding personality)
+    all_citations = project_mems + global_mems
 
     # Retrieve personality context (global preferences and traits)
     user_prefs = retrieve_memory("user preferences communication style learning", project=None, n_results=3)
@@ -110,7 +117,7 @@ def ask_agent(user_input: str, project: str, chat_history: list = None, project_
     # Learn from this conversation (adaptive personality - stays automatic)
     analyze_conversation_style(user_input, answer)
 
-    return answer
+    return answer, all_citations
 
 def execute_natural_language(task: str, project: str):
     """
@@ -471,3 +478,130 @@ def extract_memories_from_text(text: str, project: str | None) -> int:
                 stored_count += 1
     
     return stored_count
+
+
+def summarize_conversation(chat_history: list, project: str) -> str:
+    """
+    Summarize a chat session into key points and store as a memory.
+    Returns the summary text, or empty string if failed.
+    """
+    if not chat_history:
+        return ""
+    
+    # Build conversation text
+    conv_text = ""
+    for msg in chat_history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        conv_text += f"{role}: {msg['content']}\n\n"
+    
+    prompt = f"""
+    Summarize this research conversation into a concise summary that captures:
+    - Main topics discussed
+    - Key questions asked and answers given
+    - Important insights, theorems, or formulas mentioned
+    - Decisions made or conclusions reached
+    - Any action items or next steps
+    
+    Keep the summary focused and useful for future reference. Use bullet points.
+    If formulas were discussed, include them using LaTeX ($...$ for inline, $$...$$ for block).
+    
+    Conversation:
+    {conv_text}
+    """
+    
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are summarizing a research conversation. Be concise but capture all important details."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    summary = resp.choices[0].message.content.strip()
+    
+    if summary:
+        # Store the summary as a memory
+        import time
+        timestamp = time.strftime("%Y-%m-%d %H:%M")
+        store_memory_if_unique(
+            text=f"**Session Summary ({timestamp})**\n\n{summary}",
+            metadata={
+                "name": f"Session Summary - {timestamp}",
+                "type": "insight",
+                "importance": 4,
+                "source": "conversation_summary"
+            },
+            project=project
+        )
+    
+    return summary
+
+
+# =============================================================================
+# PAPER SEARCH (Semantic Scholar API)
+# =============================================================================
+
+def search_papers(query: str, limit: int = 5) -> list:
+    """
+    Search for academic papers using Semantic Scholar API.
+    Returns list of paper dicts with title, authors, year, abstract, url.
+    """
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    params = {
+        "query": query,
+        "limit": limit,
+        "fields": "title,authors,year,abstract,url,citationCount"
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        papers = []
+        for paper in data.get("data", []):
+            authors = paper.get("authors", [])
+            author_names = ", ".join([a.get("name", "") for a in authors[:3]])
+            if len(authors) > 3:
+                author_names += " et al."
+            
+            papers.append({
+                "title": paper.get("title", "Untitled"),
+                "authors": author_names,
+                "year": paper.get("year", "N/A"),
+                "abstract": paper.get("abstract", "No abstract available."),
+                "url": paper.get("url", ""),
+                "citations": paper.get("citationCount", 0)
+            })
+        
+        return papers
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def format_paper_results(papers: list) -> str:
+    """Format paper search results as markdown."""
+    if not papers:
+        return "No papers found."
+    
+    if papers and "error" in papers[0]:
+        return f"Error searching papers: {papers[0]['error']}"
+    
+    lines = ["## 📚 Paper Search Results\n"]
+    
+    for i, p in enumerate(papers, 1):
+        lines.append(f"### {i}. {p['title']}")
+        lines.append(f"**Authors:** {p['authors']}")
+        lines.append(f"**Year:** {p['year']} | **Citations:** {p['citations']}")
+        if p['url']:
+            lines.append(f"**Link:** [{p['url']}]({p['url']})")
+        lines.append("")
+        
+        # Truncate abstract if too long
+        abstract = p['abstract'] or "No abstract available."
+        if len(abstract) > 500:
+            abstract = abstract[:500] + "..."
+        lines.append(f"*{abstract}*")
+        lines.append("\n---\n")
+    
+    return "\n".join(lines)

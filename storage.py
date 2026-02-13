@@ -106,3 +106,22 @@ def load_ingested() -> dict:
 
 def save_ingested(obj: dict) -> None:
     INGESTED_FILE.write_text(json.dumps(obj, indent=2))
+
+def clear_ingested_for_project(project: str) -> int:
+    """Clear all ingestion records for a project. Returns count cleared."""
+    ingested = load_ingested()
+    if project in ingested:
+        count = len(ingested[project])
+        del ingested[project]
+        save_ingested(ingested)
+        return count
+    return 0
+
+def clear_ingested_file(project: str, file_hash: str) -> bool:
+    """Clear ingestion record for a specific file. Returns True if cleared."""
+    ingested = load_ingested()
+    if project in ingested and file_hash in ingested[project]:
+        del ingested[project][file_hash]
+        save_ingested(ingested)
+        return True
+    return False

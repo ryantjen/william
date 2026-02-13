@@ -142,6 +142,37 @@ def retrieve_memory(query: str, project: str | None = None, n_results: int = 4):
     )
     return results.get("documents", [[]])[0]
 
+
+def retrieve_memory_with_metadata(query: str, project: str | None = None, n_results: int = 4):
+    """
+    Retrieve memories with full metadata for citation tracking.
+    Returns list of dicts: [{id, text, name, type, source}, ...]
+    """
+    where_filter = {"project": project} if project else None
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results,
+        where=where_filter,
+        include=["documents", "metadatas"]
+    )
+    
+    docs = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
+    ids = results.get("ids", [[]])[0]
+    
+    memories = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else {}
+        mem_id = ids[i] if i < len(ids) else ""
+        memories.append({
+            "id": mem_id,
+            "text": doc,
+            "name": meta.get("name", ""),
+            "type": meta.get("type", "unknown"),
+            "source": meta.get("source", "unknown")
+        })
+    return memories
+
 def retrieve_hybrid_memory(query: str, project: str, n_project: int = 4, n_global: int = 3):
     """
     Hybrid: pull project-specific + global memories and combine (project first).
