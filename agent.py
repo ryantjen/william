@@ -353,7 +353,13 @@ def should_store_memory(user_input: str, answer: str, project: str):
     Return JSON with a "memories" array. Each memory should have:
     - name (a short descriptive title, e.g. "Central Limit Theorem", "bootstrap_ci", "CLT Example")
     - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
-    - importance (1-5)
+    - importance (1-5) - Use the FULL range relative to the memories you're extracting:
+      * 5 = Critical/fundamental (core theorems, essential definitions, key methodologies)
+      * 4 = Very important (important functions, significant insights, major results)
+      * 3 = Moderately important (useful examples, helpful functions, standard concepts)
+      * 2 = Somewhat useful (minor insights, edge cases, less common examples)
+      * 1 = Nice to have (trivial examples, obvious facts, minor details)
+      IMPORTANT: Distribute importance across the full 1-5 range. Don't default everything to 3+.
     - text (the full content - see formatting rules below)
 
     **FORMATTING RULES for text field:**
@@ -367,9 +373,9 @@ def should_store_memory(user_input: str, answer: str, project: str):
 
     Example response:
     {{"memories": [
-        {{"name": "Random Variable Definition", "type": "definition", "importance": 4, "text": "**Random Variable**\\n\\nA random variable is a function that maps outcomes from a sample space to real numbers. Denoted as $X: \\\\Omega \\\\to \\\\mathbb{{R}}$."}},
+        {{"name": "Central Limit Theorem", "type": "theorem", "importance": 5, "text": "**Central Limit Theorem**\\n\\n..."}},
         {{"name": "bootstrap_ci", "type": "function", "importance": 4, "text": "**bootstrap_ci**\\n\\nComputes bootstrap confidence interval for a dataset.\\n\\n```python\\ndef bootstrap_ci(data, n_boot=1000, alpha=0.05):\\n    import numpy as np\\n    samples = [np.mean(np.random.choice(data, len(data))) for _ in range(n_boot)]\\n    return np.percentile(samples, [100*alpha/2, 100*(1-alpha/2)])\\n```"}},
-        {{"name": "CLT Example - Dice", "type": "example", "importance": 3, "text": "**Example: CLT with Dice**\\n\\nRolling a fair die 100 times: $\\\\mu = 3.5$, $\\\\sigma^2 = 35/12$.\\n\\nBy CLT, $\\\\bar{{X}} \\\\sim N(3.5, 35/1200) = N(3.5, 0.029)$"}}
+        {{"name": "CLT Example - Dice", "type": "example", "importance": 2, "text": "**Example: CLT with Dice**\\n\\nRolling a fair die 100 times: $\\\\mu = 3.5$, $\\\\sigma^2 = 35/12$.\\n\\nBy CLT, $\\\\bar{{X}} \\\\sim N(3.5, 35/1200) = N(3.5, 0.029)$"}}
     ]}}
     """
 
@@ -421,7 +427,13 @@ def should_store_simulation(task: str, code: str, output: str, project: str):
     Return JSON with a "memories" array. Each memory should have:
     - name (a short descriptive title, e.g. "Monte Carlo Pi Estimate", "bootstrap_ci", "Bootstrap CI Example")
     - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
-    - importance (1-5)
+    - importance (1-5) - Use the FULL range relative to the memories you're extracting:
+      * 5 = Critical/fundamental (core results, essential methodologies, breakthrough insights)
+      * 4 = Very important (important functions, significant findings, key patterns)
+      * 3 = Moderately important (useful code patterns, helpful examples, standard results)
+      * 2 = Somewhat useful (minor optimizations, edge cases, less critical details)
+      * 1 = Nice to have (trivial calculations, obvious patterns, minor notes)
+      IMPORTANT: Distribute importance across the full 1-5 range. Don't default everything to 3+.
     - text (the full content - see formatting rules below)
 
     **FORMATTING RULES for text field:**
@@ -637,7 +649,13 @@ def extract_memories_from_text(text: str, project: str | None) -> int:
     Return JSON with a "memories" array. Each memory should have:
     - name (a short descriptive title, e.g. "Central Limit Theorem", "bootstrap_ci", "CLT Example")
     - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
-    - importance (1-5)
+    - importance (1-5) - Use the FULL range relative to the memories you're extracting:
+      * 5 = Critical/fundamental (core theorems, essential definitions, foundational concepts)
+      * 4 = Very important (important functions, significant insights, key methodologies)
+      * 3 = Moderately important (useful examples, helpful functions, standard concepts)
+      * 2 = Somewhat useful (minor insights, edge cases, less common examples)
+      * 1 = Nice to have (trivial examples, obvious facts, minor details)
+      IMPORTANT: Distribute importance across the full 1-5 range. Don't default everything to 3+.
     - text (the full content - see formatting rules below)
 
     **FORMATTING RULES for text field:**
