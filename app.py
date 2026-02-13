@@ -797,7 +797,7 @@ with tab_memory:
 
             col_cb, col_exp = st.columns([1, 30])
             with col_cb:
-                st.checkbox("", key=f"sel_{mem_id}", label_visibility="collapsed")
+                st.checkbox("Select memory", key=f"sel_{mem_id}", label_visibility="collapsed")
             with col_exp:
                 with st.expander(title, expanded=False):
                     edit_key = f"editing_{mem_id}"
