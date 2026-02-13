@@ -169,7 +169,9 @@ def retrieve_memory_with_metadata(query: str, project: str | None = None, n_resu
             "text": doc,
             "name": meta.get("name", ""),
             "type": meta.get("type", "unknown"),
-            "source": meta.get("source", "unknown")
+            "source": meta.get("source", "unknown"),
+            "confidence": int(meta.get("confidence", 0)),
+            "created_at": int(meta.get("created_at", 0)),
         })
     return memories
 
@@ -192,12 +194,27 @@ def retrieve_hybrid_memory(query: str, project: str, n_project: int = 4, n_globa
 def list_memories(
     project: str | None = None,
     where_extra: dict | None = None,
-    limit: int = 200
+    limit: int = 200,
+    global_only: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Fetch memories with optional metadata filters. Returns list of dicts:
     {id, text, metadata}
+    If global_only=True, returns only memories without a project (global memories).
     """
+    if global_only:
+        res = collection.get(where=None, include=["documents", "metadatas"])
+        items = []
+        for mid, doc, md in zip(res.get("ids", []), res.get("documents", []), res.get("metadatas", [])):
+            meta = md or {}
+            if "project" not in meta:
+                items.append({"id": mid, "text": doc, "metadata": meta})
+        if where_extra:
+            for k, v in where_extra.items():
+                items = [it for it in items if (it["metadata"] or {}).get(k) == v]
+        items.sort(key=lambda x: x["metadata"].get("created_at", 0), reverse=True)
+        return items[:limit]
+
     # Build where clause - use $and for multiple conditions
     conditions = []
     if project:
@@ -205,7 +222,7 @@ def list_memories(
     if where_extra:
         for k, v in where_extra.items():
             conditions.append({k: {"$eq": v}})
-    
+
     if len(conditions) == 0:
         where = None
     elif len(conditions) == 1:
@@ -229,6 +246,21 @@ def list_memories(
 
 def delete_memory(mem_id: str):
     collection.delete(ids=[mem_id])
+
+def delete_memories(ids: List[str]) -> int:
+    """Delete multiple memories by id. Returns count deleted."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return 0
+    collection.delete(ids=ids)
+    return len(ids)
+
+def set_memory_irrelevant(mem_id: str, irrelevant: bool) -> bool:
+    """Mark or unmark a memory as irrelevant. Returns True if successful."""
+    mem = get_memory_by_id(mem_id)
+    if not mem:
+        return False
+    return update_memory(mem_id, mem["text"], {"irrelevant": irrelevant})
 
 def update_memory(mem_id: str, new_text: str, new_metadata: dict = None) -> bool:
     """
@@ -314,7 +346,15 @@ def merge_projects(source_project: str, target_project: str) -> int:
     
     return len(ids)
 
-def count_memories(project: str | None = None, where_extra: dict | None = None) -> int:
+def count_memories(project: str | None = None, where_extra: dict | None = None, global_only: bool = False) -> int:
+    if global_only:
+        res = collection.get(where=None, include=["metadatas"])
+        items = [md or {} for md in (res.get("metadatas") or []) if "project" not in (md or {})]
+        if where_extra:
+            for k, v in where_extra.items():
+                items = [m for m in items if m.get(k) == v]
+        return len(items)
+
     # Build where clause - use $and for multiple conditions
     conditions = []
     if project:
@@ -322,14 +362,14 @@ def count_memories(project: str | None = None, where_extra: dict | None = None) 
     if where_extra:
         for k, v in where_extra.items():
             conditions.append({k: {"$eq": v}})
-    
+
     if len(conditions) == 0:
         where = None
     elif len(conditions) == 1:
         where = conditions[0]
     else:
         where = {"$and": conditions}
-    
+
     res = collection.get(where=where, include=[])
     return len(res.get("ids", []))
 

@@ -10,7 +10,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from config import OPENAI_API_KEY, MODEL_NAME
-from memory import retrieve_memory, retrieve_memory_with_metadata, store_memory, store_memory_if_unique, retrieve_hybrid_memory
+from memory import retrieve_memory, retrieve_memory_with_metadata, store_memory, store_memory_if_unique, retrieve_hybrid_memory, list_memories, delete_memory
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -69,36 +69,50 @@ def _parse_json_from_llm(raw: str) -> dict | None:
 def build_personality_prompt(user_prefs: list, agent_traits: list) -> str:
     """
     Build a personality context block from retrieved preferences and traits.
+    Accepts list of dicts with 'text' and 'confidence'. Sorts by confidence (highest first).
     Returns a string to inject into the system prompt.
     """
+    def _format_sorted(items: list, limit: int = 5) -> str:
+        if not items:
+            return ""
+        # Sort by confidence desc, then recency desc (newer wins on ties)
+        sorted_items = sorted(
+            items,
+            key=lambda x: (x.get("confidence", 0), x.get("created_at", 0)),
+            reverse=True
+        )
+        texts = [m["text"] if isinstance(m, dict) else m for m in sorted_items[:limit]]
+        return "\n".join(f"- {t}" for t in texts)
+
     sections = []
-    
     if user_prefs:
-        prefs_text = "\n".join(f"- {p}" for p in user_prefs)
-        sections.append(f"User preferences (adapt your style accordingly):\n{prefs_text}")
-    
+        prefs_text = _format_sorted(user_prefs)
+        if prefs_text:
+            sections.append(f"User preferences (adapt your style accordingly):\n{prefs_text}")
     if agent_traits:
-        traits_text = "\n".join(f"- {t}" for t in agent_traits)
-        sections.append(f"Your communication traits (what works well):\n{traits_text}")
-    
+        traits_text = _format_sorted(agent_traits)
+        if traits_text:
+            sections.append(f"Your communication traits (what works well):\n{traits_text}")
     if not sections:
         return ""
-    
     return "\n\n".join(sections)
 
 def _retrieve_memories_parallel(user_input: str, project: str, include_personality: bool = True):
     """
     Run memory retrievals in parallel. If include_personality=False (cache hit), only 2 fetches.
     Returns (project_mems, global_mems, user_prefs, agent_traits).
+    user_prefs and agent_traits are list of dicts with text, confidence (for ordering).
     """
     if include_personality:
         with ThreadPoolExecutor(max_workers=4) as ex:
             f1 = ex.submit(retrieve_memory_with_metadata, user_input, project, 8)
             f2 = ex.submit(retrieve_memory_with_metadata, user_input, None, 4)
-            f3 = ex.submit(retrieve_memory, "user preferences communication style learning", None, 3)
-            f4 = ex.submit(retrieve_memory, "agent personality traits approach style", None, 3)
+            f3 = ex.submit(retrieve_memory_with_metadata, "user preferences communication style learning", None, 5)
+            f4 = ex.submit(retrieve_memory_with_metadata, "agent personality traits approach style", None, 5)
             project_mems, global_mems = f1.result(), f2.result()
-            user_prefs, agent_traits = f3.result(), f4.result()
+            raw_prefs, raw_traits = f3.result(), f4.result()
+            user_prefs = [m for m in raw_prefs if m.get("type") == "user_preference"]
+            agent_traits = [m for m in raw_traits if m.get("type") == "agent_trait"]
     else:
         with ThreadPoolExecutor(max_workers=2) as ex:
             f1 = ex.submit(retrieve_memory_with_metadata, user_input, project, 8)
@@ -124,7 +138,7 @@ def _build_messages_for_ask(user_input: str, project: str, project_goal: str | N
     if project_goal:
         messages.append({"role": "system", "content": f"Current project: {project}\nProject goal: {project_goal}\n\nTailor your responses to help achieve this goal."})
     if chat_history:
-        recent_history = chat_history[-10:]
+        recent_history = chat_history[-20:]
         for msg in recent_history:
             messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "system", "content": f"Project memories ('{project}'):\n{project_block}"})
@@ -433,6 +447,47 @@ def should_store_simulation(task: str, code: str, output: str, project: str):
     data = _parse_json_from_llm(resp.choices[0].message.content)
     return data.get("memories", []) if data else []
 
+def _get_contradicted_ids(new_text: str, mem_type: str) -> list:
+    """
+    Check if new_text contradicts existing memories of mem_type.
+    Returns list of memory ids to delete (contradicted ones). New memory should supersede them.
+    """
+    existing = list_memories(project=None, where_extra={"type": mem_type}, limit=20, global_only=True)
+    if not existing:
+        return []
+    existing_texts = [m["text"] for m in existing if m.get("text")]
+    if not existing_texts:
+        return []
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(existing_texts[:10]))
+    prompt = f"""Existing {mem_type.replace('_', ' ')}s:
+{numbered}
+
+New observation to store: "{new_text}"
+
+Which existing one(s) does the new observation CONTRADICT? (e.g. "prefers concise" vs "prefers detailed" - the new replaces the old)
+Reply with the number(s) of contradicted ones (e.g. "1" or "1, 3"), or "none" if no contradiction."""
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "Identify which existing items the new observation contradicts. Reply with numbers (e.g. 1 or 1, 3) or none."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        answer = (resp.choices[0].message.content or "").strip().lower()
+        if "none" in answer or not answer:
+            return []
+        ids_to_delete = []
+        for part in answer.replace(",", " ").split():
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part) - 1  # 1-based to 0-based
+                if 0 <= idx < len(existing):
+                    ids_to_delete.append(existing[idx]["id"])
+        return ids_to_delete
+    except Exception:
+        return []  # On error, allow store (fail open)
+
 def analyze_conversation_style(user_input: str, response: str):
     """
     Analyze conversation and extract:
@@ -489,10 +544,14 @@ def analyze_conversation_style(user_input: str, response: str):
     if confidence < 4:
         return
 
-    # Store user preference if flagged
+    # Store user preference if flagged (supersede contradicted, then store new)
     if data.get("store_preference") and data.get("preference_text"):
-        store_memory(
-            text=data["preference_text"],
+        pref_text = data["preference_text"]
+        contradicted_ids = _get_contradicted_ids(pref_text, "user_preference")
+        for mem_id in contradicted_ids:
+            delete_memory(mem_id)
+        store_memory_if_unique(
+            text=pref_text,
             metadata={
                 "type": "user_preference",
                 "confidence": confidence,
@@ -501,10 +560,14 @@ def analyze_conversation_style(user_input: str, response: str):
             project=None  # Global - applies across all projects
         )
 
-    # Store agent trait if flagged
+    # Store agent trait if flagged (supersede contradicted, then store new)
     if data.get("store_trait") and data.get("trait_text"):
-        store_memory(
-            text=data["trait_text"],
+        trait_text = data["trait_text"]
+        contradicted_ids = _get_contradicted_ids(trait_text, "agent_trait")
+        for mem_id in contradicted_ids:
+            delete_memory(mem_id)
+        store_memory_if_unique(
+            text=trait_text,
             metadata={
                 "type": "agent_trait",
                 "confidence": confidence,

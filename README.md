@@ -4,19 +4,21 @@ An AI-powered research assistant with persistent memory, file ingestion, and Pyt
 
 ## Features
 
-- **Chat with Memory** - Conversations are enhanced with relevant context from your research history
-- **Citation Tracking** - See which memories influenced each response
+- **Chat with Memory** - Conversations use the last 20 messages plus relevant memories from your research history
+- **Citation Tracking** - Each response shows Sources (memories referenced), displayed before Save to Memory
 - **Smart File Ingestion** - Upload PDFs, CSVs, and text files with intelligent chunking and table understanding
 - **Code Execution** - Run Python code directly with `run:` or generate code from natural language with `nlrun:`
-- **Paper Search** - Search academic papers with `papers:` using Semantic Scholar
-- **Memory Dashboard** - Search, filter, edit, and manage your stored memories
-- **Memory Export** - Export memories as JSON, Markdown, or LaTeX
+- **Paper Search** - Search academic papers with `papers:` using Semantic Scholar *(faulty for now; will update later)*
+- **Memory Dashboard** - Search, filter by importance (1–5) or irrelevant tag, select memories, and bulk delete
+- **Memory Export** - Export selected memories as JSON, Markdown, or LaTeX via an Export popover
 - **Memory Map** - Visualize your memories in 2D semantic space to see clusters and connections
 - **Spaced Repetition** - Review tab with flashcard-style quiz for memorization
 - **Conversation Summaries** - Summarize chat sessions and save to memory
 - **Project Organization** - Keep research organized by project with optional goals
 - **Project Management** - Delete projects or merge them together
-- **Adaptive Personality** - The agent learns your communication preferences over time
+- **Adaptive Personality** - Learns your communication preferences; supersedes conflicting preferences when you change them
+- **Scope Toggle** - View memories for "This project" or "Global" in the Memory Dashboard
+- **Irrelevant Tag** - Mark memories as irrelevant to filter them out or focus on them
 - **Multiple Memory Types** - Store definitions, theorems, formulas, functions, examples, insights, and more
 
 ## Setup
@@ -100,7 +102,7 @@ nlrun: plot a sine wave from 0 to 2pi
 ```
 papers: bootstrap confidence intervals
 ```
-Searches Semantic Scholar for relevant papers. You can save the results to memory for future reference.
+*Faulty for now — will update later.* Intended to search Semantic Scholar for relevant papers and save results to memory.
 
 ### Save to Memory
 Click the 💾 **Save to Memory** button on any assistant message to extract and store important knowledge (theorems, insights, formulas, etc.).
@@ -123,14 +125,25 @@ Go to the **Files** tab to upload PDFs, CSVs, or text files. Files are processed
 - Clear all records when memories are deleted
 
 ### Memory Dashboard
-Use the **Memory Dashboard** tab to search, filter, and manage your stored memories by type, date, or keyword. You can also edit existing memories.
+Use the **Memory Dashboard** tab to search, filter, and manage your stored memories.
 
-**Memory types include:** definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology
+**Filters:**
+- **Scope** - View "This project" or "Global" memories
+- **Importance** - Filter by score (1–5)
+- **Irrelevant** - Exclude irrelevant, show all, or show only irrelevant memories
+- **Type, date, keyword** - Standard search and filter
 
-**Export options:**
+**Selection & actions:**
+- Select individual memories or use **Select all** / **Clear**
+- **Mark irrelevant** / **Unmark irrelevant** on individual memories
+- **Delete selected** to bulk remove memories
+
+**Export** (only selected memories):
 - 📥 JSON - Full data export for backup or processing
 - 📥 Markdown - Human-readable format
 - 📥 LaTeX - Ready to compile for papers/documents
+
+**Memory types include:** definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology
 
 ### Memory Map
 Use the **Memory Map** tab to visualize all your memories in a 2D semantic space. Similar memories cluster together, making it easy to see relationships. Click on any point to view the full memory content.
@@ -158,7 +171,7 @@ Use the **Review** tab to test your knowledge with flashcard-style quizzes:
 - **🗑️ Clear chat** - Start fresh while keeping your memories
 
 ### Citation Tracking
-Each response shows which memories were referenced, so you can see what influenced the agent's answer. Click to expand and view the cited memories.
+Each response shows **Sources** — which memories were referenced — so you can see what influenced the agent's answer. Sources appear above the Save to Memory button and persist across reruns. Click to expand and view the cited memories.
 
 ## Project Structure
 

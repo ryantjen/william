@@ -22,6 +22,25 @@ def convert_latex_for_streamlit(text: str) -> str:
     
     return text
 
+
+STYLE_CONTEXT_TYPES = ("agent_trait", "user_preference")
+
+
+def render_citations(citations: list) -> None:
+    """
+    Display content sources, excluding style context (agent_trait, user_preference).
+    """
+    content = [c for c in citations if c.get("type") not in STYLE_CONTEXT_TYPES]
+    if not content:
+        return
+    with st.expander(f"📚 Sources ({len(content)} memories referenced)", expanded=False):
+        for c in content:
+            raw = c.get("name") or c.get("text", "") or ""
+            name = raw[:50] + "..." if len(raw) > 50 else raw
+            mtype = c.get("type", "unknown")
+            st.markdown(f"- **{mtype}**: {name}")
+
+
 from storage import (
     load_projects, save_projects, get_project_names, get_project_goal, set_project_goal,
     load_chat, save_chat, delete_chat,
@@ -30,7 +49,8 @@ from storage import (
 
 from memory import (
     store_memory, store_memories, store_memory_if_unique, store_memories_if_unique,
-    list_memories, delete_memory, update_memory, get_memory_by_id,
+    list_memories, delete_memory, delete_memories, update_memory, get_memory_by_id,
+    set_memory_irrelevant,
     delete_project_memories, merge_projects,
     count_memories, get_all_embeddings
 )
@@ -267,26 +287,30 @@ with tab_chat:
             st.markdown(convert_latex_for_streamlit(msg["content"]))
 
             if msg["role"] == "assistant":
+                # Sources first (where answer came from) - before Save to Memory so it isn't overrun
+                citations = msg.get("citations") or []
+                valid_citations = [c for c in citations if c.get("name") or c.get("text")]
+                if valid_citations:
+                    render_citations(valid_citations)
+
                 # Find the preceding user message for this exchange
                 user_input = ""
                 if i > 0 and st.session_state.chat[i-1]["role"] == "user":
                     user_input = st.session_state.chat[i-1]["content"]
                 
-                col1, col2 = st.columns([1, 5])
-                with col1:
-                    if st.button("💾 Save to Memory", key=f"save_mem_{active_project}_{i}"):
-                        with st.spinner("Extracting memories..."):
-                            stored, extracted = extract_memories_from_exchange(
-                                user_input=user_input,
-                                answer=msg["content"],
-                                project=active_project
-                            )
-                        if stored > 0:
-                            st.success(f"Saved {stored} memory(s).")
-                        elif extracted > 0:
-                            st.info(f"Found {extracted} potential memories, but they were similar to existing ones.")
-                        else:
-                            st.info("Nothing worth saving was found in this exchange.")
+                if st.button("💾 Save to Memory", key=f"save_mem_{active_project}_{i}"):
+                    with st.spinner("Extracting memories..."):
+                        stored, extracted = extract_memories_from_exchange(
+                            user_input=user_input,
+                            answer=msg["content"],
+                            project=active_project
+                        )
+                    if stored > 0:
+                        st.success(f"Saved {stored} memory(s).")
+                    elif extracted > 0:
+                        st.info(f"Found {extracted} potential memories, but they were similar to existing ones.")
+                    else:
+                        st.info("Nothing worth saving was found in this exchange.")
 
     # Display any pending figures from run:/nlrun: (saved before rerun)
     if st.session_state.get("pending_figs"):
@@ -308,6 +332,7 @@ with tab_chat:
             st.markdown(user_text)
 
         # Produce assistant response
+        valid_citations = []  # filled only for normal chat
         with st.chat_message("assistant"):
 
             # 1) Direct Python
@@ -409,20 +434,17 @@ with tab_chat:
                 st.write_stream(stream_gen)
                 response_for_history = result_holder.get("answer", "")
                 citations = result_holder.get("citations", [])
-                
-                # Display citations if any
-                if citations:
-                    # Filter to only show memories with actual content
-                    valid_citations = [c for c in citations if c.get("name") or c.get("text")]
-                    if valid_citations:
-                        with st.expander(f"📚 Sources ({len(valid_citations)} memories referenced)", expanded=False):
-                            for c in valid_citations:
-                                name = c.get("name") or c.get("text", "")[:50] + "..."
-                                mtype = c.get("type", "unknown")
-                                st.markdown(f"- **{mtype}**: {name}")
+                valid_citations = [c for c in citations if c.get("name") or c.get("text")] if citations else []
 
-        # Save assistant message
-        st.session_state.chat.append({"role": "assistant", "content": response_for_history})
+                # Display citations if any
+                if valid_citations:
+                    render_citations(valid_citations)
+
+        # Save assistant message (persist citations so Sources survive rerun)
+        save_payload = {"role": "assistant", "content": response_for_history}
+        if valid_citations:
+            save_payload["citations"] = valid_citations
+        st.session_state.chat.append(save_payload)
         save_chat(active_project, st.session_state.chat)
 
         st.rerun()
@@ -602,10 +624,9 @@ with tab_add_memory:
 # =========================
 with tab_memory:
     st.subheader(f"Memory Dashboard — {active_project}")
-
-    colA, colB, colC, colD = st.columns(4)
+    colA, colB, colC, colD, colE, colF = st.columns([1, 1, 1, 1, 1, 1])
     with colA:
-        show_project_only = st.checkbox("Show only this project", value=True)
+        memory_scope = st.radio("Scope", ["This project", "Global"], horizontal=True, key="mem_scope")
     with colB:
         mem_type = st.selectbox(
             "Type filter",
@@ -617,6 +638,18 @@ with tab_memory:
             ["All time", "Last 7 days", "Last 30 days", "Last 90 days", "Last year"]
         )
     with colD:
+        importance_filter = st.selectbox(
+            "Importance",
+            ["(all)", "1", "2", "3", "4", "5"],
+            help="Filter by importance score (1=low, 5=high)"
+        )
+    with colE:
+        irrelevant_filter = st.selectbox(
+            "Irrelevant tag",
+            ["(all)", "Exclude irrelevant", "Irrelevant only"],
+            help="Filter by irrelevant tag"
+        )
+    with colF:
         limit = st.slider("Items to show", 10, 500, 100, 10)
 
     # Calculate cutoff timestamp for date filter
@@ -633,8 +666,9 @@ with tab_memory:
     if mem_type != "(all)":
         where_extra["type"] = mem_type
 
-    proj = active_project if show_project_only else None
-    total = count_memories(project=proj, where_extra=where_extra if where_extra else None)
+    scope_global = memory_scope == "Global"
+    proj = None if scope_global else active_project
+    total = count_memories(project=proj, where_extra=where_extra if where_extra else None, global_only=scope_global)
     st.caption(f"Total memories (before date filter): {total}")
 
     query = st.text_input(
@@ -644,11 +678,22 @@ with tab_memory:
     )
     st.caption("Searches text content, type, name, and source. Try: theorem, reference, insight, simulation, etc.")
 
-    items = list_memories(project=proj, where_extra=where_extra if where_extra else None, limit=limit)
+    items = list_memories(project=proj, where_extra=where_extra if where_extra else None, limit=limit, global_only=scope_global)
 
     # Apply date filter
     if date_cutoff > 0:
         items = [it for it in items if (it["metadata"] or {}).get("created_at", 0) >= date_cutoff]
+
+    # Apply importance filter
+    if importance_filter != "(all)":
+        imp_val = int(importance_filter)
+        items = [it for it in items if (it["metadata"] or {}).get("importance") == imp_val]
+
+    # Apply irrelevant filter
+    if irrelevant_filter == "Exclude irrelevant":
+        items = [it for it in items if not (it["metadata"] or {}).get("irrelevant")]
+    elif irrelevant_filter == "Irrelevant only":
+        items = [it for it in items if (it["metadata"] or {}).get("irrelevant")]
 
     if query.strip():
         q = query.strip().lower()
@@ -664,105 +709,65 @@ with tab_memory:
     
     st.caption(f"Showing {len(items)} memories")
 
-    # Export buttons
+    # Selection and bulk actions
     if items:
-        export_col1, export_col2, export_col3, export_col4 = st.columns([1, 1, 1, 3])
-        with export_col1:
-            # JSON export
-            export_data = []
-            for it in items:
-                export_data.append({
-                    "id": it["id"],
-                    "text": it["text"],
-                    "metadata": it["metadata"]
-                })
-            json_str = json.dumps(export_data, indent=2, default=str)
-            st.download_button(
-                "📥 JSON",
-                data=json_str,
-                file_name=f"memories_{active_project}_{int(time.time())}.json",
-                mime="application/json"
-            )
-        with export_col2:
-            # Markdown export
-            md_lines = [f"# Memories Export — {active_project}\n"]
-            md_lines.append(f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            md_lines.append(f"Total: {len(items)} memories\n\n---\n")
-            
-            for it in items:
-                md = it["metadata"] or {}
-                name = md.get("name", "Untitled")
-                mtype = md.get("type", "unknown")
-                created = md.get("created_at", "")
-                text = it["text"] or ""
-                
-                md_lines.append(f"\n## {name}\n")
-                md_lines.append(f"**Type:** {mtype} | **Created:** {created}\n\n")
-                md_lines.append(f"{text}\n")
-                md_lines.append("\n---\n")
-            
-            markdown_str = "".join(md_lines)
-            st.download_button(
-                "📥 Markdown",
-                data=markdown_str,
-                file_name=f"memories_{active_project}_{int(time.time())}.md",
-                mime="text/markdown"
-            )
-        with export_col3:
-            # LaTeX export
-            def escape_latex(s):
-                """Escape special LaTeX characters except math delimiters."""
-                # Don't escape $ since we use it for math
-                chars = {'&': r'\&', '%': r'\%', '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}'}
-                for old, new in chars.items():
-                    # Avoid escaping inside math mode
-                    s = s.replace(old, new)
-                return s
-            
-            latex_lines = [
-                r"\documentclass{article}",
-                r"\usepackage{amsmath,amssymb,amsthm}",
-                r"\usepackage[margin=1in]{geometry}",
-                r"\usepackage{hyperref}",
-                r"\usepackage{listings}",
-                r"\lstset{basicstyle=\ttfamily\small,breaklines=true}",
-                r"",
-                r"\title{" + f"Memory Export — {active_project}" + r"}",
-                r"\date{" + time.strftime('%Y-%m-%d') + r"}",
-                r"\begin{document}",
-                r"\maketitle",
-                r"",
-            ]
-            
-            for it in items:
-                md = it["metadata"] or {}
-                name = md.get("name", "Untitled")
-                mtype = md.get("type", "unknown")
-                text = it["text"] or ""
-                
-                latex_lines.append(r"\section{" + escape_latex(name) + r"}")
-                latex_lines.append(r"\textbf{Type:} " + escape_latex(mtype) + r"\\[0.5em]")
-                
-                # Convert markdown bold to LaTeX and handle code blocks
-                content = text
-                content = re.sub(r'\*\*(.+?)\*\*', r'\\textbf{\1}', content)
-                content = re.sub(r'```python\n(.*?)\n```', r'\\begin{lstlisting}[language=Python]\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
-                content = re.sub(r'```\n?(.*?)\n?```', r'\\begin{lstlisting}\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
-                
-                latex_lines.append(content)
-                latex_lines.append(r"")
-                latex_lines.append(r"\hrulefill")
-                latex_lines.append(r"")
-            
-            latex_lines.append(r"\end{document}")
-            latex_str = "\n".join(latex_lines)
-            
-            st.download_button(
-                "📥 LaTeX",
-                data=latex_str,
-                file_name=f"memories_{active_project}_{int(time.time())}.tex",
-                mime="text/x-tex"
-            )
+        selected_count = sum(1 for it in items if st.session_state.get(f"sel_{it['id']}", False))
+        sel_row1, sel_row2, sel_row3 = st.columns([1, 1, 4])
+        with sel_row1:
+            if st.button("Select all", key="mem_sel_all"):
+                for it in items:
+                    st.session_state[f"sel_{it['id']}"] = True
+                st.rerun()
+        with sel_row2:
+            if st.button("Clear", key="mem_sel_clear"):
+                keys_to_clear = [k for k in list(st.session_state.keys()) if k.startswith("sel_")]
+                for k in keys_to_clear:
+                    st.session_state[k] = False  # Set to False so checkboxes render unchecked
+                st.rerun()
+        with sel_row3:
+            if selected_count > 0:
+                if st.button(f"🗑️ Delete ({selected_count})", type="primary", key="mem_bulk_del"):
+                    ids_to_delete = [it["id"] for it in items if st.session_state.get(f"sel_{it['id']}", False)]
+                    deleted = delete_memories(ids_to_delete)
+                    for mid in ids_to_delete:
+                        st.session_state.pop(f"sel_{mid}", None)
+                    st.success(f"Deleted {deleted} memory(ies).")
+                    st.rerun()
+
+    # Export dropdown (exports only selected memories)
+    if items:
+        def _escape_latex(s):
+            chars = {'&': r'\&', '%': r'\%', '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}'}
+            for old, new in chars.items():
+                s = s.replace(old, new)
+            return s
+
+        items_to_export = [it for it in items if st.session_state.get(f"sel_{it['id']}", False)]
+
+        with st.popover("📥 Export", use_container_width=True):
+            if not items_to_export:
+                st.caption("Select memories to export")
+            else:
+                export_data = [{"id": it["id"], "text": it["text"], "metadata": it["metadata"]} for it in items_to_export]
+                st.download_button("JSON", data=json.dumps(export_data, indent=2, default=str), file_name=f"memories_{active_project}_{int(time.time())}.json", mime="application/json", key="exp_json")
+                md_lines = [f"# Memories Export — {active_project}\n", f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n", f"Total: {len(items_to_export)} memories\n\n---\n"]
+                for it in items_to_export:
+                    md = it["metadata"] or {}
+                    md_lines.append(f"\n## {md.get('name', 'Untitled')}\n**Type:** {md.get('type', 'unknown')} | **Created:** {md.get('created_at', '')}\n\n{it['text'] or ''}\n\n---\n")
+                st.download_button("Markdown", data="".join(md_lines), file_name=f"memories_{active_project}_{int(time.time())}.md", mime="text/markdown", key="exp_md")
+                latex_lines = [r"\documentclass{article}", r"\usepackage{amsmath,amssymb,amsthm}", r"\usepackage[margin=1in]{geometry}", r"\usepackage{hyperref}", r"\usepackage{listings}", r"\lstset{basicstyle=\ttfamily\small,breaklines=true}", r"", r"\title{" + f"Memory Export — {active_project}" + r"}", r"\date{" + time.strftime('%Y-%m-%d') + r"}", r"\begin{document}", r"\maketitle", r""]
+                for it in items_to_export:
+                    md = it["metadata"] or {}
+                    text = it["text"] or ""
+                    content = re.sub(r'\*\*(.+?)\*\*', r'\\textbf{\1}', text)
+                    content = re.sub(r'```python\n(.*?)\n```', r'\\begin{lstlisting}[language=Python]\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
+                    content = re.sub(r'```\n?(.*?)\n?```', r'\\begin{lstlisting}\n\1\n\\end{lstlisting}', content, flags=re.DOTALL)
+                    latex_lines.append(r"\section{" + _escape_latex(md.get("name", "Untitled")) + r"}")
+                    latex_lines.append(r"\textbf{Type:} " + _escape_latex(md.get("type", "unknown")) + r"\\[0.5em]")
+                    latex_lines.append(content)
+                    latex_lines.append(r"\hrulefill")
+                latex_lines.append(r"\end{document}")
+                st.download_button("LaTeX", data="\n".join(latex_lines), file_name=f"memories_{active_project}_{int(time.time())}.tex", mime="text/x-tex", key="exp_latex")
 
     if not items:
         st.info("No memories found with current filters.")
@@ -773,70 +778,82 @@ with tab_memory:
             mtype = md.get("type", "(no type)")
             name = md.get("name", "")
             text = it["text"] or ""
+            mem_id = it["id"]
+            is_irrelevant = bool(md.get("irrelevant"))
 
             # Generate a short preview title
-            # Use first line or first 80 chars, whichever is shorter
             first_line = text.split("\n")[0].strip()
             preview = first_line[:80] + ("..." if len(first_line) > 80 else "")
             
-            # Build expander title
+            # Build expander title (include irrelevant badge)
             if name:
                 title = f"📄 **{mtype}** — {name}"
             elif preview:
                 title = f"📄 **{mtype}** — {preview}"
             else:
                 title = f"📄 **{mtype}**"
+            if is_irrelevant:
+                title = f"🏷️ {title}"
 
-            with st.expander(title, expanded=False):
-                mem_id = it["id"]
-                edit_key = f"editing_{mem_id}"
-                
-                # Check if we're in edit mode for this memory
-                if st.session_state.get(edit_key, False):
-                    # Edit mode
-                    st.markdown("**Editing memory:**")
-                    edited_text = st.text_area(
-                        "Content",
-                        value=text,
-                        height=200,
-                        key=f"edit_text_{mem_id}"
-                    )
-                    
-                    col1, col2, col3 = st.columns([1, 1, 2])
-                    with col1:
-                        if st.button("💾 Save", key=f"save_{mem_id}"):
-                            update_memory(mem_id, edited_text)
-                            st.session_state[edit_key] = False
-                            st.success("Memory updated!")
-                            st.rerun()
-                    with col2:
-                        if st.button("❌ Cancel", key=f"cancel_{mem_id}"):
-                            st.session_state[edit_key] = False
-                            st.rerun()
-                else:
-                    # View mode
-                    st.markdown(convert_latex_for_streamlit(text))
-                    
-                    st.divider()
-                    
-                    # Metadata and actions
-                    col1, col2, col3 = st.columns([1, 1, 3])
-                    with col1:
-                        if st.button("✏️ Edit", key=f"edit_{mem_id}"):
-                            st.session_state[edit_key] = True
-                            st.rerun()
-                    with col2:
-                        if st.button("🗑️ Delete", key=f"del_{mem_id}"):
-                            delete_memory(mem_id)
-                            st.success("Deleted.")
-                            st.rerun()
-                    with col3:
-                        edited_time = md.get("last_edited")
-                        edit_info = f" · edited: {time.strftime('%Y-%m-%d', time.localtime(edited_time))}" if edited_time else ""
-                        st.caption(f"id: {mem_id[:12]}... · created: {created}{edit_info}")
-                    
-                    with st.expander("View metadata", expanded=False):
-                        st.json(md)
+            col_cb, col_exp = st.columns([1, 30])
+            with col_cb:
+                st.checkbox("", key=f"sel_{mem_id}", label_visibility="collapsed")
+            with col_exp:
+                with st.expander(title, expanded=False):
+                    edit_key = f"editing_{mem_id}"
+                    # Check if we're in edit mode for this memory
+                    if st.session_state.get(edit_key, False):
+                        # Edit mode
+                        st.markdown("**Editing memory:**")
+                        edited_text = st.text_area(
+                            "Content",
+                            value=text,
+                            height=200,
+                            key=f"edit_text_{mem_id}"
+                        )
+                        col1, col2, col3 = st.columns([1, 1, 2])
+                        with col1:
+                            if st.button("💾 Save", key=f"save_{mem_id}"):
+                                update_memory(mem_id, edited_text)
+                                st.session_state[edit_key] = False
+                                st.success("Memory updated!")
+                                st.rerun()
+                        with col2:
+                            if st.button("❌ Cancel", key=f"cancel_{mem_id}"):
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                    else:
+                        # View mode
+                        st.markdown(convert_latex_for_streamlit(text))
+                        st.divider()
+                        # Metadata and actions
+                        col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+                        with col1:
+                            if st.button("✏️ Edit", key=f"edit_{mem_id}"):
+                                st.session_state[edit_key] = True
+                                st.rerun()
+                        with col2:
+                            if st.button("🗑️ Delete", key=f"del_{mem_id}"):
+                                delete_memory(mem_id)
+                                st.success("Deleted.")
+                                st.rerun()
+                        with col3:
+                            if is_irrelevant:
+                                if st.button("✓ Unmark irrelevant", key=f"unmark_irr_{mem_id}"):
+                                    set_memory_irrelevant(mem_id, False)
+                                    st.success("Unmarked.")
+                                    st.rerun()
+                            else:
+                                if st.button("🏷️ Mark irrelevant", key=f"mark_irr_{mem_id}"):
+                                    set_memory_irrelevant(mem_id, True)
+                                    st.success("Marked as irrelevant.")
+                                    st.rerun()
+                        with col4:
+                            edited_time = md.get("last_edited")
+                            edit_info = f" · edited: {time.strftime('%Y-%m-%d', time.localtime(edited_time))}" if edited_time else ""
+                            st.caption(f"id: {mem_id[:12]}... · created: {created}{edit_info}")
+                        with st.expander("View metadata", expanded=False):
+                            st.json(md)
 
 # =========================
 # TAB: MEMORY MAP
