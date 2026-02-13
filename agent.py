@@ -3,13 +3,20 @@
 # .venv\Scripts\activate to activate virtual environment in terminal (Windows)
 
 import json
+import re
+import time
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from config import OPENAI_API_KEY, MODEL_NAME
 from memory import retrieve_memory, retrieve_memory_with_metadata, store_memory, store_memory_if_unique, retrieve_hybrid_memory
-from tools import run_python
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Personality cache: {(project, msg_count_key): (user_prefs, agent_traits)}
+# Refresh every N messages to keep context fresh
+PERSONALITY_CACHE_REFRESH_EVERY = 5
 
 SYSTEM_PROMPT = """
 You are a Statistical Research Copilot named William.
@@ -25,8 +32,39 @@ Use relevant past research memory if helpful.
 Think step-by-step before answering.
 Respond in Markdown. For math, use LaTeX with $ for inline (e.g., $x^2$) and $$ for blocks (e.g., $$\\int_0^1 f(x) dx$$).
 Do NOT use \\( \\) or \\[ \\] for math - only use $ and $$.
-Try to answer as succintly as possible as to not overwhelm the user, but can elaborate if needed.
+Try to answer as succinctly as possible so as not to overwhelm the user, but can elaborate if needed.
 """
+
+def _parse_json_from_llm(raw: str) -> dict | None:
+    """
+    Extract and parse JSON from LLM response. Handles markdown wrapping and common issues.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    # Strip markdown code blocks: ```json ... ``` or ``` ... ```
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        text = match.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Try to find a JSON object - look for {...}
+        start = text.find("{")
+        if start >= 0:
+            depth = 0
+            for i, c in enumerate(text[start:], start):
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start : i + 1])
+                        except json.JSONDecodeError:
+                            break
+    return None
+
 
 def build_personality_prompt(user_prefs: list, agent_traits: list) -> str:
     """
@@ -48,6 +86,55 @@ def build_personality_prompt(user_prefs: list, agent_traits: list) -> str:
     
     return "\n\n".join(sections)
 
+def _retrieve_memories_parallel(user_input: str, project: str, include_personality: bool = True):
+    """
+    Run memory retrievals in parallel. If include_personality=False (cache hit), only 2 fetches.
+    Returns (project_mems, global_mems, user_prefs, agent_traits).
+    """
+    if include_personality:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            f1 = ex.submit(retrieve_memory_with_metadata, user_input, project, 8)
+            f2 = ex.submit(retrieve_memory_with_metadata, user_input, None, 4)
+            f3 = ex.submit(retrieve_memory, "user preferences communication style learning", None, 3)
+            f4 = ex.submit(retrieve_memory, "agent personality traits approach style", None, 3)
+            project_mems, global_mems = f1.result(), f2.result()
+            user_prefs, agent_traits = f3.result(), f4.result()
+    else:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f1 = ex.submit(retrieve_memory_with_metadata, user_input, project, 8)
+            f2 = ex.submit(retrieve_memory_with_metadata, user_input, None, 4)
+            project_mems, global_mems = f1.result(), f2.result()
+            user_prefs, agent_traits = [], []
+    return project_mems, global_mems, user_prefs, agent_traits
+
+
+def _get_cached_personality(project: str, chat_history_len: int) -> str | None:
+    """Return cached personality block if valid, else None."""
+    if not hasattr(_get_cached_personality, "_cache"):
+        _get_cached_personality._cache = {}
+    key = (project, chat_history_len // PERSONALITY_CACHE_REFRESH_EVERY)
+    return _get_cached_personality._cache.get(key)
+
+
+def _build_messages_for_ask(user_input: str, project: str, project_goal: str | None,
+                            project_block: str, global_block: str, personality_block: str,
+                            chat_history: list | None) -> list:
+    """Build the messages list for chat completion."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if project_goal:
+        messages.append({"role": "system", "content": f"Current project: {project}\nProject goal: {project_goal}\n\nTailor your responses to help achieve this goal."})
+    if chat_history:
+        recent_history = chat_history[-10:]
+        for msg in recent_history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "system", "content": f"Project memories ('{project}'):\n{project_block}"})
+    messages.append({"role": "system", "content": f"Global memories:\n{global_block}"})
+    if personality_block:
+        messages.append({"role": "system", "content": personality_block})
+    messages.append({"role": "user", "content": user_input})
+    return messages
+
+
 def ask_agent(user_input: str, project: str, chat_history: list = None, project_goal: str = None):
     """
     Context hierarchy (highest to lowest priority):
@@ -58,94 +145,119 @@ def ask_agent(user_input: str, project: str, chat_history: list = None, project_
     5. Personality context (communication style)
     
     Returns: tuple (answer: str, citations: list of memory dicts)
+    Uses parallel memory retrieval, personality caching, and background personality analysis.
     """
-    # Retrieve memories with metadata for citation tracking
-    project_mems = retrieve_memory_with_metadata(user_input, project=project, n_results=8)
-    global_mems = retrieve_memory_with_metadata(user_input, project=None, n_results=4)
+    chat_len = len(chat_history) if chat_history else 0
+    cached_personality = _get_cached_personality(project, chat_len)
+    include_personality = cached_personality is None
     
-    # De-duplicate global (remove any that appear in project by text)
+    # Parallel memory retrieval (2 or 4 fetches depending on cache)
+    project_mems, global_mems, user_prefs, agent_traits = _retrieve_memories_parallel(user_input, project, include_personality)
+    
+    # De-duplicate global
     project_texts = set(m["text"] for m in project_mems)
     global_mems = [m for m in global_mems if m["text"] not in project_texts]
     
-    # Build text blocks for prompt
     project_block = "\n".join(f"- {m['text']}" for m in project_mems) if project_mems else "- (none)"
     global_block = "\n".join(f"- {m['text']}" for m in global_mems) if global_mems else "- (none)"
-    
-    # Combine all cited memories (excluding personality)
     all_citations = project_mems + global_mems
+    
+    # Personality: use cache or freshly fetched, update cache
+    if cached_personality is not None:
+        personality_block = cached_personality
+    else:
+        personality_block = build_personality_prompt(user_prefs, agent_traits)
+        _get_cached_personality._cache[(project, chat_len // PERSONALITY_CACHE_REFRESH_EVERY)] = personality_block
+    
+    messages = _build_messages_for_ask(user_input, project, project_goal, project_block, global_block, personality_block, chat_history)
 
-    # Retrieve personality context (global preferences and traits)
-    user_prefs = retrieve_memory("user preferences communication style learning", project=None, n_results=3)
-    agent_traits = retrieve_memory("agent personality traits approach style", project=None, n_results=3)
-    personality_block = build_personality_prompt(user_prefs, agent_traits)
+    try:
+        resp = _chat_completion_with_retry(messages)
+        answer = resp.choices[0].message.content
+    except Exception as e:
+        answer = f"Sorry, I encountered an error: {e}. Please try again."
+        all_citations = []
 
-    # Build messages in priority order
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-    ]
-    
-    # 1. Project goal (highest context priority)
-    if project_goal:
-        messages.append({"role": "system", "content": f"Current project: {project}\nProject goal: {project_goal}\n\nTailor your responses to help achieve this goal."})
-    
-    # 2. Chat history (recent conversation context)
-    if chat_history:
-        # Limit to last 10 messages (5 exchanges) to avoid token overflow
-        recent_history = chat_history[-10:]
-        for msg in recent_history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-    
-    # 3. Project memories (specific to this project)
-    messages.append({"role": "system", "content": f"Project memories ('{project}'):\n{project_block}"})
-    
-    # 4. Global memories (cross-project knowledge)
-    messages.append({"role": "system", "content": f"Global memories:\n{global_block}"})
-    
-    # 5. Personality context (communication style - lowest priority)
-    if personality_block:
-        messages.append({"role": "system", "content": personality_block})
-    
-    # Add current user input
-    messages.append({"role": "user", "content": user_input})
-
-    resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages
-    )
-    answer = resp.choices[0].message.content
-
-    # Learn from this conversation (adaptive personality - stays automatic)
-    analyze_conversation_style(user_input, answer)
+    # Background: learn from conversation (non-blocking)
+    if answer and not answer.startswith("Sorry, I encountered"):
+        threading.Thread(target=analyze_conversation_style, args=(user_input, answer), daemon=True).start()
 
     return answer, all_citations
 
-def execute_natural_language(task: str, project: str):
-    """
-    Natural language -> Python code -> execute.
-    """
-    prompt = f"""
-    Write Python code to accomplish the task below.
-    Rules:
-    - Only output code (no explanations and no Python markdown formatting).
-    - Use matplotlib for plots if needed.
-    - Do NOT call plt.show().
-    - If plotting, create the figure normally (Streamlit will render it).
-    Task: {task}
-    Notes:
-    - Use standard libraries when possible.
-    - If you generate plots, save them to 'plot.png' in the current directory.
-    """
-    code_resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "You write clean Python code for statistics and data analysis."},
-            {"role": "user", "content": prompt},
-        ]
-    )
-    code = code_resp.choices[0].message.content
-    output = run_python(code)
 
-    # 🧠 Memory gate - store multiple memories with duplicate detection
+def ask_agent_stream(user_input: str, project: str, chat_history: list = None, project_goal: str = None, result_holder: dict = None):
+    """
+    Same as ask_agent but streams the response. Yields chunks for display.
+    Caller must pass result_holder={} - it will be filled with {"answer": str, "citations": list} when done.
+    """
+    if result_holder is None:
+        result_holder = {}
+    
+    chat_len = len(chat_history) if chat_history else 0
+    cached_personality = _get_cached_personality(project, chat_len)
+    include_personality = cached_personality is None
+    
+    project_mems, global_mems, user_prefs, agent_traits = _retrieve_memories_parallel(user_input, project, include_personality)
+    
+    project_texts = set(m["text"] for m in project_mems)
+    global_mems = [m for m in global_mems if m["text"] not in project_texts]
+    
+    project_block = "\n".join(f"- {m['text']}" for m in project_mems) if project_mems else "- (none)"
+    global_block = "\n".join(f"- {m['text']}" for m in global_mems) if global_mems else "- (none)"
+    all_citations = project_mems + global_mems
+    
+    if cached_personality is not None:
+        personality_block = cached_personality
+    else:
+        personality_block = build_personality_prompt(user_prefs, agent_traits)
+        _get_cached_personality._cache[(project, chat_len // PERSONALITY_CACHE_REFRESH_EVERY)] = personality_block
+    
+    messages = _build_messages_for_ask(user_input, project, project_goal, project_block, global_block, personality_block, chat_history)
+
+    try:
+        stream = client.chat.completions.create(model=MODEL_NAME, messages=messages, stream=True)
+        full_answer = []
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                full_answer.append(delta)
+                yield delta
+        
+        answer = "".join(full_answer)
+        
+        # Background personality analysis
+        if answer and not answer.startswith("Sorry, I encountered"):
+            threading.Thread(target=analyze_conversation_style, args=(user_input, answer), daemon=True).start()
+        
+        result_holder["answer"] = answer
+        result_holder["citations"] = all_citations
+        
+    except Exception as e:
+        err_msg = f"Sorry, I encountered an error: {e}. Please try again."
+        yield err_msg
+        result_holder["answer"] = err_msg
+        result_holder["citations"] = []
+
+def _chat_completion_with_retry(messages: list, max_retries: int = 2):
+    """Call OpenAI API with retry on transient failures (rate limit, timeout, connection)."""
+    last_error = None
+    err_str_lower = ""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.chat.completions.create(model=MODEL_NAME, messages=messages)
+            return resp
+        except Exception as e:
+            last_error = e
+            err_str_lower = str(e).lower()
+            if attempt < max_retries and any(kw in err_str_lower for kw in ("rate", "timeout", "connection", "503", "502")):
+                time.sleep(2 ** attempt)
+                continue
+            raise last_error
+    raise last_error
+
+
+def store_simulation_memories(task: str, code: str, output: str, project: str) -> None:
+    """Extract and store memories from a code execution result. Call after run_python."""
     memories_to_store = should_store_simulation(task, code, output, project)
     for mem in memories_to_store:
         if mem.get("text"):
@@ -160,7 +272,42 @@ def execute_natural_language(task: str, project: str):
                 project=project
             )
 
-    return output, code
+
+def execute_natural_language(task: str, project: str) -> str:
+    """
+    Natural language -> Python code. Returns code only (no execution).
+    Passes project memories (especially csv_summary, csv_column) for context.
+    """
+    # Retrieve relevant project memories for context (dataset summaries, column info, etc.)
+    project_mems = retrieve_memory_with_metadata(task, project=project, n_results=5)
+    context_block = ""
+    if project_mems:
+        # Prefer csv_summary and csv_column for data tasks
+        def fmt(m):
+            t = m["text"]
+            return f"- {m['name']}: {t[:600]}..." if len(t) > 600 else f"- {m['name']}: {t}"
+        context_lines = [fmt(m) for m in project_mems[:4]]
+        context_block = "\n\nRelevant context from project memory (column names, dataset structure - use if applicable):\n" + "\n".join(context_lines)
+    
+    prompt = f"""
+Write Python code to accomplish the task below.
+Rules:
+- Only output code (no explanations and no markdown formatting).
+- Use matplotlib for plots if needed. Do NOT call plt.show().
+- If plotting, create the figure normally (Streamlit will render it).
+- numpy is available as np, pandas as pd.
+Task: {task}
+{context_block}
+"""
+    try:
+        code_resp = _chat_completion_with_retry([
+            {"role": "system", "content": "You write clean Python code for statistics and data analysis. Output only code, no markdown."},
+            {"role": "user", "content": prompt},
+        ])
+    except Exception as e:
+        return f"# API error: {e}\n# Task: {task}"
+    
+    return code_resp.choices[0].message.content
 
 def should_store_memory(user_input: str, answer: str, project: str):
     """
@@ -218,18 +365,16 @@ def should_store_memory(user_input: str, answer: str, project: str):
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "Return only valid JSON with a 'memories' array. Format formulas with $$...$$ on their own line for block display. Use $...$ for inline math only."},
+            {"role": "system", "content": "Return only valid JSON with a 'memories' array. No markdown. Escape backslashes in text: use \\\\frac not \\frac. Use $...$ and $$...$$ for math."},
             {"role": "user", "content": gate_prompt},
         ]
     )
 
     raw = resp.choices[0].message.content.strip()
-    try:
-        data = json.loads(raw)
-        return data.get("memories", [])
-    except Exception:
-        # fail safe: return empty list if parsing fails
+    data = _parse_json_from_llm(raw)
+    if data is None:
         return []
+    return data.get("memories", [])
 
 def should_store_simulation(task: str, code: str, output: str, project: str):
     """
@@ -280,16 +425,13 @@ def should_store_simulation(task: str, code: str, output: str, project: str):
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "Return only valid JSON with a 'memories' array. Format formulas with $$...$$ on their own line for block display. Use $...$ for inline math only."},
+            {"role": "system", "content": "Return only valid JSON with a 'memories' array. No markdown. Escape backslashes: use \\\\frac not \\frac."},
             {"role": "user", "content": gate_prompt},
         ]
     )
 
-    try:
-        data = json.loads(resp.choices[0].message.content)
-        return data.get("memories", [])
-    except Exception:
-        return []
+    data = _parse_json_from_llm(resp.choices[0].message.content)
+    return data.get("memories", []) if data else []
 
 def analyze_conversation_style(user_input: str, response: str):
     """
@@ -375,14 +517,15 @@ def analyze_conversation_style(user_input: str, response: str):
 # ON-DEMAND MEMORY EXTRACTION (called by user action, not automatic)
 # =============================================================================
 
-def extract_memories_from_exchange(user_input: str, answer: str, project: str) -> int:
+def extract_memories_from_exchange(user_input: str, answer: str, project: str) -> tuple[int, int]:
     """
     On-demand: Extract and store memories from a chat exchange.
     Called when user clicks "Save to Memory" button.
-    Returns count of memories stored.
+    Returns (stored_count, extracted_count).
     """
     memories = should_store_memory(user_input, answer, project)
     stored_count = 0
+    extracted_count = sum(1 for m in memories if m.get("text"))
     
     for mem in memories:
         if mem.get("text"):
@@ -396,10 +539,10 @@ def extract_memories_from_exchange(user_input: str, answer: str, project: str) -
                 },
                 project=project
             )
-            if result:  # Not a duplicate
+            if result:
                 stored_count += 1
     
-    return stored_count
+    return stored_count, extracted_count
 
 def extract_memories_from_text(text: str, project: str | None) -> int:
     """
@@ -450,16 +593,13 @@ def extract_memories_from_text(text: str, project: str | None) -> int:
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "Return only valid JSON with a 'memories' array. Format formulas with $$...$$ on their own line for block display. Use $...$ for inline math only."},
+            {"role": "system", "content": "Return only valid JSON with a 'memories' array. No markdown. Escape backslashes: use \\\\frac not \\frac."},
             {"role": "user", "content": gate_prompt},
         ]
     )
 
-    try:
-        data = json.loads(resp.choices[0].message.content.strip())
-        memories = data.get("memories", [])
-    except Exception:
-        return 0
+    data = _parse_json_from_llm(resp.choices[0].message.content)
+    memories = data.get("memories", []) if data else []
 
     stored_count = 0
     for mem in memories:

@@ -5,7 +5,7 @@ import json
 import streamlit as st
 import pandas as pd
 
-from agent import ask_agent, execute_natural_language, extract_memories_from_exchange, extract_memories_from_text, summarize_conversation, search_papers, format_paper_results
+from agent import ask_agent, ask_agent_stream, execute_natural_language, store_simulation_memories, extract_memories_from_exchange, extract_memories_from_text, summarize_conversation, search_papers, format_paper_results
 from tools import run_python
 
 
@@ -276,15 +276,17 @@ with tab_chat:
                 with col1:
                     if st.button("💾 Save to Memory", key=f"save_mem_{active_project}_{i}"):
                         with st.spinner("Extracting memories..."):
-                            count = extract_memories_from_exchange(
+                            stored, extracted = extract_memories_from_exchange(
                                 user_input=user_input,
                                 answer=msg["content"],
                                 project=active_project
                             )
-                        if count > 0:
-                            st.success(f"Saved {count} memory(s).")
+                        if stored > 0:
+                            st.success(f"Saved {stored} memory(s).")
+                        elif extracted > 0:
+                            st.info(f"Found {extracted} potential memories, but they were similar to existing ones.")
                         else:
-                            st.info("No new memories extracted (may be duplicates or trivial).")
+                            st.info("Nothing worth saving was found in this exchange.")
 
     # Display any pending figures from run:/nlrun: (saved before rerun)
     if st.session_state.get("pending_figs"):
@@ -334,28 +336,36 @@ with tab_chat:
             elif user_text.startswith("nlrun:"):
                 task = user_text[len("nlrun:"):].strip()
 
-                # generate code
-                _, code = execute_natural_language(task, project=active_project)
+                # Generate code (no execution yet)
+                code = execute_natural_language(task, project=active_project)
 
-                # run it in-process so plots render
-                run_out, figs = run_python(code)
+                # Check for API errors (returned as comment)
+                if code.strip().startswith("# API error:"):
+                    st.error(code.strip().replace("# API error: ", ""))
+                    response_for_history = f"**Error:** {code.strip()}"
+                else:
+                    # Run once
+                    run_out, figs = run_python(code)
 
-                st.markdown("**Generated code:**")
-                st.code(code, language="python")
+                    # Store memories from this execution
+                    store_simulation_memories(task, code, run_out, active_project)
 
-                if run_out:
-                    st.markdown("**Output:**")
-                    st.code(run_out, language="text")
+                    st.markdown("**Generated code:**")
+                    st.code(code, language="python")
 
-                if figs:
-                    st.markdown("**Plots:**")
-                    for fig in figs:
-                        st.pyplot(fig)
-                    # Save figures to session state for redisplay after rerun
-                    st.session_state["pending_figs"] = figs
+                    if run_out:
+                        st.markdown("**Output:**")
+                        st.code(run_out, language="text")
 
-                # Include code in history so it displays on reload
-                response_for_history = f"**Generated code:**\n```python\n{code}\n```\n\n**Output:**\n```\n{run_out}\n```"
+                    if figs:
+                        st.markdown("**Plots:**")
+                        for fig in figs:
+                            st.pyplot(fig)
+                        # Save figures to session state for redisplay after rerun
+                        st.session_state["pending_figs"] = figs
+
+                    # Include code in history so it displays on reload
+                    response_for_history = f"**Generated code:**\n```python\n{code}\n```\n\n**Output:**\n```\n{run_out}\n```"
 
             # 3) Paper search
             elif user_text.startswith("papers:"):
@@ -384,13 +394,21 @@ with tab_chat:
                             )
                         st.success(f"Saved {len(papers)} paper references to memory!")
 
-            # 4) Normal chat
+            # 4) Normal chat (with streaming)
             else:
-                # Pass chat history for context (exclude the just-added user message)
                 history_for_context = st.session_state.chat[:-1]
                 project_goal = get_project_goal(projects, active_project)
-                response_for_history, citations = ask_agent(user_text, project=active_project, chat_history=history_for_context, project_goal=project_goal)
-                st.markdown(convert_latex_for_streamlit(response_for_history))
+                result_holder = {}
+                stream_gen = ask_agent_stream(
+                    user_text, project=active_project,
+                    chat_history=history_for_context,
+                    project_goal=project_goal,
+                    result_holder=result_holder
+                )
+                # Stream the response; when done, result_holder has answer + citations
+                st.write_stream(stream_gen)
+                response_for_history = result_holder.get("answer", "")
+                citations = result_holder.get("citations", [])
                 
                 # Display citations if any
                 if citations:
@@ -591,7 +609,7 @@ with tab_memory:
     with colB:
         mem_type = st.selectbox(
             "Type filter",
-            ["(all)", "definition", "theorem", "formula", "function", "example", "insight", "assumption", "decision", "result", "reference", "methodology", "user_preference", "agent_trait", "pdf_chunk", "txt_chunk", "csv_chunk", "simulation"]
+            ["(all)", "definition", "theorem", "formula", "function", "example", "insight", "assumption", "decision", "result", "reference", "methodology", "user_preference", "agent_trait", "pdf_chunk", "txt_chunk", "csv_chunk", "csv_summary", "csv_column", "simulation"]
         )
     with colC:
         date_filter = st.selectbox(
