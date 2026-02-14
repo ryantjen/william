@@ -1,7 +1,9 @@
 from __future__ import annotations
 from typing import Optional, List, Dict, Any
+import math
 import time
 import hashlib
+from pathlib import Path
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -146,66 +148,97 @@ def store_memories_if_unique(texts: List[str], metadatas: List[dict], project: s
 
     return ids_stored, duplicates_skipped
 
-def retrieve_memory(query: str, project: str | None = None, n_results: int = 4):
-    """
-    Retrieve memories filtered by project if provided.
-    """
-    where_filter = {"project": project} if project else None
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results,
-        where=where_filter
-    )
-    return results.get("documents", [[]])[0]
+# Re-ranking constants (tuned for low latency: small weights, simple math)
+_OVER_FETCH = 2  # Fetch 2x then re-rank down (minimal extra cost)
+_RECENCY_HALF_LIFE_DAYS = 60
+_RECENCY_WEIGHT = 0.15
+_IMPORTANCE_WEIGHT = 0.08
 
 
 def retrieve_memory_with_metadata(query: str, project: str | None = None, n_results: int = 4):
     """
     Retrieve memories with full metadata for citation tracking.
-    Returns list of dicts: [{id, text, name, type, source}, ...]
+    Over-fetches, re-ranks by similarity + recency + importance, returns top n_results.
+    Returns list of dicts: [{id, text, name, type, source, importance, created_at}, ...]
     """
     where_filter = {"project": project} if project else None
+    fetch_n = min(n_results * _OVER_FETCH, 50)  # Cap to avoid huge pulls
+    
     results = collection.query(
         query_texts=[query],
-        n_results=n_results,
+        n_results=fetch_n,
         where=where_filter,
-        include=["documents", "metadatas"]
+        include=["documents", "metadatas", "distances"]
     )
     
     docs = results.get("documents", [[]])[0]
     metas = results.get("metadatas", [[]])[0]
     ids = results.get("ids", [[]])[0]
+    distances = results.get("distances", [[]])[0]
     
-    memories = []
+    now = int(time.time())
+    scored = []
     for i, doc in enumerate(docs):
         meta = metas[i] if i < len(metas) else {}
         mem_id = ids[i] if i < len(ids) else ""
+        dist = distances[i] if i < len(distances) else 1.0
+        
+        # Similarity: cosine distance 0=identical, 2=opposite
+        similarity = max(0.0, 1.0 - (dist / 2.0))
+        
+        # Recency: use last_accessed_at if set, else created_at
+        ts = meta.get("last_accessed_at") or meta.get("created_at", now)
+        age_days = (now - ts) / 86400.0
+        recency_bonus = math.exp(-age_days / _RECENCY_HALF_LIFE_DAYS)
+        
+        # Importance: 1-5 -> [0, 1], default 3
+        imp = int(meta.get("importance", 3))
+        imp = max(1, min(5, imp))
+        importance_bonus = (imp - 1) / 4.0
+        
+        score = (
+            similarity
+            + _RECENCY_WEIGHT * recency_bonus
+            + _IMPORTANCE_WEIGHT * importance_bonus
+        )
+        scored.append((score, mem_id, doc, meta))
+    
+    scored.sort(key=lambda x: -x[0])
+    
+    memories = []
+    for _, mem_id, doc, meta in scored[:n_results]:
         memories.append({
             "id": mem_id,
             "text": doc,
             "name": meta.get("name", ""),
             "type": meta.get("type", "unknown"),
             "source": meta.get("source", "unknown"),
+            "importance": int(meta.get("importance", 3)),
             "confidence": int(meta.get("confidence", 0)),
             "created_at": int(meta.get("created_at", 0)),
         })
     return memories
 
-def retrieve_hybrid_memory(query: str, project: str, n_project: int = 4, n_global: int = 3):
-    """
-    Hybrid: pull project-specific + global memories and combine (project first).
-    """
-    project_docs = retrieve_memory(query, project=project, n_results=n_project)
-    global_docs = retrieve_memory(query, project=None, n_results=n_global)
 
-    # de-duplicate while preserving order
-    seen = set()
-    combined = []
-    for d in (project_docs + global_docs):
-        if d and d not in seen:
-            seen.add(d)
-            combined.append(d)
-    return combined
+def touch_memories(mem_ids: List[str]) -> None:
+    """
+    Update last_accessed_at for cited memories. Call from a background thread
+    so it does not add latency to the main request.
+    """
+    if not mem_ids:
+        return
+    mem_ids = list(dict.fromkeys(mem_ids))  # dedupe preserving order
+    now = int(time.time())
+    res = collection.get(ids=mem_ids, include=["documents", "metadatas"])
+    for i, mid in enumerate(res.get("ids", [])):
+        doc = (res.get("documents") or [])[i] if i < len(res.get("documents", [])) else ""
+        meta = dict((res.get("metadatas") or [])[i] if i < len(res.get("metadatas", [])) else {})
+        meta["last_accessed_at"] = now
+        try:
+            collection.delete(ids=[mid])
+            collection.add(documents=[doc], metadatas=[meta], ids=[mid])
+        except Exception:
+            pass  # Don't fail background touch
 
 def list_memories(
     project: str | None = None,
@@ -256,13 +289,6 @@ def delete_memories(ids: List[str]) -> int:
         return 0
     collection.delete(ids=ids)
     return len(ids)
-
-def set_memory_irrelevant(mem_id: str, irrelevant: bool) -> bool:
-    """Mark or unmark a memory as irrelevant. Returns True if successful."""
-    mem = get_memory_by_id(mem_id)
-    if not mem:
-        return False
-    return update_memory(mem_id, mem["text"], {"irrelevant": irrelevant})
 
 def update_memory(mem_id: str, new_text: str, new_metadata: dict = None) -> bool:
     """
@@ -360,6 +386,81 @@ def count_memories(project: str | None = None, where_extra: dict | None = None, 
     where = _build_where(project, where_extra)
     res = collection.get(where=where, include=[])
     return len(res.get("ids", []))
+
+
+def get_memory_stats() -> Dict[str, Any]:
+    """
+    Return storage health stats: total_memories, disk_size_mb, embedding_model.
+    """
+    total = len(collection.get(where=None, include=[]).get("ids", []))
+    chroma_path = Path("./chroma_storage")
+    disk_bytes = 0
+    if chroma_path.exists():
+        disk_bytes = sum(f.stat().st_size for f in chroma_path.rglob("*") if f.is_file())
+    from config import EMBEDDING_MODEL
+    # Use GB for >= 1 GB, else MB
+    if disk_bytes >= 1024**3:
+        disk_display = f"{disk_bytes / 1024**3:.2f} GB"
+    else:
+        disk_display = f"{disk_bytes / 1024**2:.2f} MB"
+    return {
+        "total_memories": total,
+        "disk_display": disk_display,
+        "embedding_model": EMBEDDING_MODEL,
+    }
+
+
+def prune_low_importance(
+    project: str | None = None,
+    importance_below: int = 2,
+    limit: int = 100,
+    global_only: bool = False,
+) -> int:
+    """
+    Delete memories with importance <= importance_below.
+    Returns count deleted.
+    """
+    items = list_memories(project=project, limit=2000, global_only=global_only)
+    to_delete = [
+        it["id"]
+        for it in items
+        if (it.get("metadata") or {}).get("importance", 3) <= importance_below
+    ][:limit]
+    if not to_delete:
+        return 0
+    delete_memories(to_delete)
+    return len(to_delete)
+
+
+def prune_neglected(
+    project: str | None = None,
+    importance_below: int = 2,
+    older_than_days: int = 365,
+    limit: int = 100,
+    global_only: bool = False,
+) -> int:
+    """
+    Delete low-importance memories that are old and never cited (no last_accessed_at).
+    Safer than prune_low_importance - only removes memories that are likely stale.
+    Returns count deleted.
+    """
+    items = list_memories(project=project, limit=2000, global_only=global_only)
+    cutoff = int(time.time()) - (older_than_days * 86400)
+    to_delete = []
+    for it in items:
+        md = it.get("metadata") or {}
+        imp = md.get("importance", 3)
+        created = md.get("created_at", 0)
+        last_acc = md.get("last_accessed_at")
+        if imp <= importance_below and created < cutoff and last_acc is None:
+            to_delete.append(it["id"])
+            if len(to_delete) >= limit:
+                break
+    if not to_delete:
+        return 0
+    delete_memories(to_delete)
+    return len(to_delete)
+
 
 def get_all_embeddings(project: str | None = None) -> Dict[str, Any]:
     """

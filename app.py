@@ -5,7 +5,7 @@ import json
 import streamlit as st
 import pandas as pd
 
-from agent import ask_agent, ask_agent_stream, execute_natural_language, store_simulation_memories, extract_memories_from_exchange, extract_memories_from_text, summarize_conversation, search_papers, format_paper_results
+from agent import ask_agent, ask_agent_stream, execute_natural_language, extract_memories_from_exchange, extract_memories_from_text, summarize_conversation, search_papers, format_paper_results, parse_task_from_text, parse_event_from_text
 from tools import run_python
 
 
@@ -50,15 +50,52 @@ from storage import (
 from memory import (
     store_memory, store_memories, store_memory_if_unique, store_memories_if_unique,
     list_memories, delete_memory, delete_memories, update_memory, get_memory_by_id,
-    set_memory_irrelevant,
     delete_project_memories, merge_projects,
-    count_memories, get_all_embeddings
+    count_memories, get_all_embeddings,
+    get_memory_stats, prune_low_importance, prune_neglected
 )
 
 from ingest_files import file_sha256, ingest_txt, ingest_csv, ingest_pdf
+from docs import (
+    CHAT_HELP, FILES_HELP, ADD_MEMORY_HELP, MEMORY_HELP, MEMORY_MAP_HELP,
+    CALENDAR_HELP, REVIEW_HELP, MEMORY_FULL_DOC
+)
+from calendar_data import (
+    load_tasks, add_task, get_active_tasks, get_tasks_due_on_date, delete_task,
+    load_events, add_event, get_events_for_date, delete_event,
+    get_chunks_for_date, get_chunks_for_date_read_only, mark_chunk_complete, mark_task_complete, update_task_remaining_estimate, refresh_chunks_for_date, get_task_completion_pct,
+    cleanup_past_due, cleanup_past_events, migrate_from_tasks,
+)
 
 st.set_page_config(page_title="Statistical Research Copilot", layout="wide")
-st.title("William")
+
+# Header with Docs button in top-right
+header_col1, header_col2 = st.columns([4, 1])
+with header_col1:
+    st.title("William")
+with header_col2:
+    with st.popover("📖 Docs", help="Full documentation"):
+        doc_section = st.radio(
+            "Section",
+            ["Memory System", "Chat", "Files", "Add Memory", "Memory Dashboard", "Memory Map", "Calendar", "Review"],
+            key="doc_section"
+        )
+        if doc_section == "Memory System":
+            st.markdown(MEMORY_FULL_DOC)
+        elif doc_section == "Chat":
+            st.markdown(CHAT_HELP)
+        elif doc_section == "Files":
+            st.markdown(FILES_HELP)
+        elif doc_section == "Add Memory":
+            st.markdown(ADD_MEMORY_HELP)
+        elif doc_section == "Memory Dashboard":
+            st.markdown(MEMORY_HELP)
+        elif doc_section == "Memory Map":
+            st.markdown(MEMORY_MAP_HELP)
+        elif doc_section == "Calendar":
+            st.markdown(CALENDAR_HELP)
+        else:
+            st.markdown(REVIEW_HELP)
 
 # ---------- Sidebar: Projects ----------
 projects = load_projects()  # List of {"name": ..., "goal": ...}
@@ -268,7 +305,7 @@ with st.sidebar.expander("📤 Export chat", expanded=False):
         st.caption("No chat history to export.")
 
 # ---------- Tabs ----------
-tab_chat, tab_files, tab_add_memory, tab_memory, tab_map, tab_review = st.tabs(["💬 Chat", "📁 Files", "➕ Add Memory", "🧠 Memory Dashboard", "🗺️ Memory Map", "🎯 Review"])
+tab_chat, tab_files, tab_add_memory, tab_memory, tab_map, tab_calendar, tab_review = st.tabs(["💬 Chat", "📁 Files", "➕ Add Memory", "🧠 Memory Dashboard", "🗺️ Memory Map", "📅 Calendar", "🎯 Review"])
 
 # ---------- Load chat for active project ----------
 if "chat" not in st.session_state or st.session_state.get("chat_project") != active_project:
@@ -371,9 +408,6 @@ with tab_chat:
                 else:
                     # Run once
                     run_out, figs = run_python(code)
-
-                    # Store memories from this execution
-                    store_simulation_memories(task, code, run_out, active_project)
 
                     st.markdown("**Generated code:**")
                     st.code(code, language="python")
@@ -623,14 +657,48 @@ with tab_add_memory:
 # TAB: MEMORY DASHBOARD
 # =========================
 with tab_memory:
-    st.subheader(f"Memory Dashboard — {active_project}")
-    colA, colB, colC, colD, colE, colF = st.columns([1, 1, 1, 1, 1, 1])
+    head_col, storage_col = st.columns([4, 1])
+    with head_col:
+        st.subheader(f"Memory Dashboard — {active_project}")
+    with storage_col:
+        with st.popover("Storage", help="Total memories, disk usage, embedding model"):
+            stats = get_memory_stats()
+            st.metric("Total memories", stats["total_memories"])
+            st.metric("Disk usage", stats["disk_display"])
+            st.caption("Embedding model")
+            st.code(stats["embedding_model"], language=None)
+
+    # Pruning
+    with st.expander("✂️ Prune memories", expanded=False):
+        prune_col1, prune_col2 = st.columns(2)
+        with prune_col1:
+            st.markdown("**By importance** — Delete memories with importance ≤ N")
+            prune_imp = st.selectbox("Importance ≤", [1, 2], index=1, key="prune_imp")
+            prune_scope = st.radio("Scope", ["This project", "Global"], horizontal=True, key="prune_scope")
+            prune_limit = st.number_input("Max to delete", min_value=1, max_value=500, value=50, key="prune_limit")
+            if st.button("Prune by importance", key="prune_btn"):
+                proj_prune = None if prune_scope == "Global" else active_project
+                deleted = prune_low_importance(project=proj_prune, importance_below=prune_imp, limit=prune_limit, global_only=(prune_scope == "Global"))
+                st.success(f"Deleted {deleted} memory(ies).") if deleted else st.info("No matching memories found.")
+                st.rerun()
+        with prune_col2:
+            st.markdown("**Neglected only** — Low importance + old + never cited")
+            prune_neg_days = st.number_input("Older than (days)", min_value=30, max_value=3650, value=365, key="prune_neg_days")
+            prune_neg_imp = st.selectbox("Importance ≤", [1, 2], index=1, key="prune_neg_imp")
+            prune_neg_limit = st.number_input("Max to delete", min_value=1, max_value=500, value=50, key="prune_neg_limit")
+            if st.button("Prune neglected", key="prune_neg_btn"):
+                proj_prune = None if prune_scope == "Global" else active_project
+                deleted = prune_neglected(project=proj_prune, importance_below=prune_neg_imp, older_than_days=prune_neg_days, limit=prune_neg_limit, global_only=(prune_scope == "Global"))
+                st.success(f"Deleted {deleted} memory(ies).") if deleted else st.info("No matching memories found.")
+                st.rerun()
+
+    colA, colB, colC, colD, colE = st.columns([1, 1, 1, 1, 1])
     with colA:
         memory_scope = st.radio("Scope", ["This project", "Global"], horizontal=True, key="mem_scope")
     with colB:
         mem_type = st.selectbox(
             "Type filter",
-            ["(all)", "definition", "theorem", "formula", "function", "example", "insight", "assumption", "decision", "result", "reference", "methodology", "user_preference", "agent_trait", "pdf_chunk", "txt_chunk", "csv_chunk", "csv_summary", "csv_column", "simulation"]
+            ["(all)", "definition", "theorem", "formula", "function", "example", "insight", "summary", "assumption", "decision", "result", "reference", "methodology", "user_preference", "agent_trait", "pdf_chunk", "txt_chunk", "csv_chunk", "csv_summary", "csv_column", "simulation"]
         )
     with colC:
         date_filter = st.selectbox(
@@ -644,12 +712,6 @@ with tab_memory:
             help="Filter by importance score (1=low, 5=high)"
         )
     with colE:
-        irrelevant_filter = st.selectbox(
-            "Irrelevant tag",
-            ["(all)", "Exclude irrelevant", "Irrelevant only"],
-            help="Filter by irrelevant tag"
-        )
-    with colF:
         limit = st.slider("Items to show", 10, 500, 100, 10)
 
     # Calculate cutoff timestamp for date filter
@@ -688,12 +750,6 @@ with tab_memory:
     if importance_filter != "(all)":
         imp_val = int(importance_filter)
         items = [it for it in items if (it["metadata"] or {}).get("importance") == imp_val]
-
-    # Apply irrelevant filter
-    if irrelevant_filter == "Exclude irrelevant":
-        items = [it for it in items if not (it["metadata"] or {}).get("irrelevant")]
-    elif irrelevant_filter == "Irrelevant only":
-        items = [it for it in items if (it["metadata"] or {}).get("irrelevant")]
 
     if query.strip():
         q = query.strip().lower()
@@ -779,21 +835,17 @@ with tab_memory:
             name = md.get("name", "")
             text = it["text"] or ""
             mem_id = it["id"]
-            is_irrelevant = bool(md.get("irrelevant"))
 
             # Generate a short preview title
             first_line = text.split("\n")[0].strip()
             preview = first_line[:80] + ("..." if len(first_line) > 80 else "")
             
-            # Build expander title (include irrelevant badge)
             if name:
                 title = f"📄 **{mtype}** — {name}"
             elif preview:
                 title = f"📄 **{mtype}** — {preview}"
             else:
                 title = f"📄 **{mtype}**"
-            if is_irrelevant:
-                title = f"🏷️ {title}"
 
             col_cb, col_exp = st.columns([1, 30])
             with col_cb:
@@ -827,7 +879,7 @@ with tab_memory:
                         st.markdown(convert_latex_for_streamlit(text))
                         st.divider()
                         # Metadata and actions
-                        col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+                        col1, col2, col3 = st.columns([1, 1, 3])
                         with col1:
                             if st.button("✏️ Edit", key=f"edit_{mem_id}"):
                                 st.session_state[edit_key] = True
@@ -838,17 +890,6 @@ with tab_memory:
                                 st.success("Deleted.")
                                 st.rerun()
                         with col3:
-                            if is_irrelevant:
-                                if st.button("✓ Unmark irrelevant", key=f"unmark_irr_{mem_id}"):
-                                    set_memory_irrelevant(mem_id, False)
-                                    st.success("Unmarked.")
-                                    st.rerun()
-                            else:
-                                if st.button("🏷️ Mark irrelevant", key=f"mark_irr_{mem_id}"):
-                                    set_memory_irrelevant(mem_id, True)
-                                    st.success("Marked as irrelevant.")
-                                    st.rerun()
-                        with col4:
                             edited_time = md.get("last_edited")
                             edit_info = f" · edited: {time.strftime('%Y-%m-%d', time.localtime(edited_time))}" if edited_time else ""
                             st.caption(f"id: {mem_id[:12]}... · created: {created}{edit_info}")
@@ -1093,6 +1134,203 @@ with tab_map:
             df = pd.DataFrame(st.session_state.map_data)
             type_counts = df["type"].value_counts()
             st.dataframe(type_counts.reset_index().rename(columns={"index": "Type", "type": "Count"}), hide_index=True)
+
+# =========================
+# TAB: CALENDAR
+# =========================
+with tab_calendar:
+    from datetime import datetime, timedelta
+
+    migrated = migrate_from_tasks()
+    if migrated > 0:
+        st.info(f"Migrated {migrated} task(s) from previous format.")
+    cleaned = cleanup_past_due()
+    if cleaned > 0:
+        st.caption(f"Cleaned up {cleaned} past-due task(s).")
+
+    st.subheader("📅 Calendar")
+    st.caption("Add tasks and events with natural language. Calendar shows due dates and events. Chunk board below shows daily work.")
+
+    # Add task / event
+    add_input = st.text_input(
+        "Add task or event",
+        placeholder='Task: stats hw due feb 17, 2 hours, priority 3/5 | Event: meeting feb 14 2-3pm',
+        key="cal_add_input",
+    )
+    col_add_task, col_add_ev = st.columns(2)
+    with col_add_task:
+        if st.button("Add task", key="add_task") and add_input.strip():
+            with st.spinner("Parsing..."):
+                p = parse_task_from_text(add_input.strip())
+            if p and not p.get("error"):
+                th = p.get("duration_hours")
+                th = float(th) if th is not None else 1.0
+                try:
+                    pr = max(1, min(5, int(p.get("priority") or 3)))
+                except (TypeError, ValueError):
+                    pr = 3
+                add_task(p["name"], p["due_date"], th, pr)
+                get_chunks_for_date(datetime.now().strftime("%Y-%m-%d"))  # ensure chunks for new task
+                st.success(f"Task: **{p['name']}** due {p['due_date']}")
+                st.rerun()
+            else:
+                st.error("Could not parse. Use: 'name due feb 17, 2 hours, priority 3/5'")
+    with col_add_ev:
+        if st.button("Add event", key="add_event") and add_input.strip():
+            with st.spinner("Parsing..."):
+                p = parse_event_from_text(add_input.strip())
+            if p and not p.get("error"):
+                add_event(p["name"], p["date"], p["start_time"], p["end_time"])
+                st.success(f"Event: **{p['name']}** on {p['date']} {p['start_time']}-{p['end_time']}")
+                st.rerun()
+            else:
+                st.error("Could not parse. Use: 'meeting feb 14 2-3pm'")
+
+    # Auto-cleanup past-due tasks and past events when calendar loads
+    cleanup_past_due()
+    cleanup_past_events()
+
+    # Manage tasks (delete)
+    today_str_cal = datetime.now().strftime("%Y-%m-%d")
+    active_tasks_list = get_active_tasks(today_str_cal)
+    with st.expander("Manage tasks", expanded=False):
+        if not active_tasks_list:
+            st.caption("No active tasks.")
+        else:
+            for t in active_tasks_list:
+                pct = get_task_completion_pct(t.get("id", ""))
+                total_h = t.get("total_hours", 0)
+                label = f"{t.get('name', '')} — due {t.get('due_date', '')} ({total_h}h"
+                if pct is not None and pct < 100:
+                    label += f", {pct}% done"
+                label += ")"
+                if pct is not None and pct == 100:
+                    label = f"✓ {label} — completed"
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    st.caption(label)
+                with c2:
+                    if st.button("🗑️ Delete", key=f"deltask_{t['id']}"):
+                        delete_task(t["id"])
+                        st.success("Task deleted.")
+                        st.rerun()
+    all_events = load_events()
+    if all_events:
+        with st.expander("Manage events", expanded=False):
+            for e in all_events:
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    st.caption(f"{e.get('name', '')} — {e.get('date', '')} {e.get('start_time', '')}-{e.get('end_time', '')}")
+                with c2:
+                    if st.button("🗑️", key=f"delev_{e['id']}"):
+                        delete_event(e["id"])
+                        st.success("Event deleted.")
+                        st.rerun()
+
+    # Rolling 14 days: 2 rows × 7 columns, weekdays on top, dates in corners
+    today = datetime.now().date()
+    today_str = today.strftime("%Y-%m-%d")
+    week_start = today - timedelta(days=today.weekday())  # Monday of this week
+    day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    # Refresh today's chunks when app opens (so they reflect current tasks)
+    if "cal_last_refresh" not in st.session_state or st.session_state.cal_last_refresh != today_str:
+        refresh_chunks_for_date(today_str)
+        st.session_state.cal_last_refresh = today_str
+
+    # Column headers: weekdays (calendar locked to today—no day switching)
+    header_cols = st.columns(7)
+    for i, lbl in enumerate(day_labels):
+        with header_cols[i]:
+            st.markdown(f"**{lbl}**")
+
+    # Row 1: days 0-6, Row 2: days 7-13 (rolls to next 2 weeks when date advances)
+    for row in range(2):
+        row_cols = st.columns(7)
+        for col in range(7):
+            day_idx = row * 7 + col
+            d = week_start + timedelta(days=day_idx)
+            ds = d.strftime("%Y-%m-%d")
+            with row_cols[col]:
+                is_today = ds == today_str
+                date_label = f"{d.day}" + (" •" if is_today else "")
+                st.markdown(f"**{date_label}**" if is_today else date_label)
+                # Only due tasks and events
+                due_tasks = get_tasks_due_on_date(ds)
+                events = get_events_for_date(ds)
+                for t in due_tasks:
+                    pct = get_task_completion_pct(t.get("id", ""))
+                    label = t.get("name", "")
+                    if pct is not None and 0 < pct < 100:
+                        label = f"{label} ({pct}% done)"
+                    elif pct == 100:
+                        label = f"{label} ✓"
+                    st.caption(f"📋 {label} due")
+                for e in events:
+                    st.caption(f"📌 {e.get('name', '')} {e.get('start_time', '')}-{e.get('end_time', '')}")
+
+    # Daily chunk board — always today, no day switching
+    st.divider()
+    sel_date = datetime.strptime(today_str, "%Y-%m-%d").date()
+    st.subheader(f"Daily chunk board — {today_str} ({day_labels[sel_date.weekday()]})")
+    st.caption("Work chunks for today. Mark done to complete. Chunks regenerate on app open based on current tasks.")
+
+    # Use read-only load so _ensure_chunks_for_date doesn't overwrite completed chunks on every display.
+    # Chunks are ensured by refresh_chunks_for_date on first load (above).
+    chunks = get_chunks_for_date_read_only(today_str)
+    incomplete = [ch for ch in chunks if not ch.get("completed")]
+
+    # Optional form for "expected time to complete rest" (appears when user clicks ⏱ on a chunk)
+    if "chunk_set_remaining_pending" in st.session_state:
+        pending = st.session_state.chunk_set_remaining_pending
+        with st.form("chunk_remaining_form", clear_on_submit=True):
+            st.caption(f"Task: {pending.get('name', '')}")
+            hours = st.number_input(
+                "Expected time to complete the rest of assignment (hours)",
+                min_value=0.0, max_value=40.0, value=0.5, step=0.25, format="%.2f",
+                key="chunk_remaining_hours"
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                submitted = st.form_submit_button("Save & complete chunk")
+            with col2:
+                cancelled = st.form_submit_button("Cancel")
+            if submitted:
+                mark_chunk_complete(pending["id"], actual_minutes=pending.get("mins", 30))
+                update_task_remaining_estimate(pending["task_id"], hours)
+                if "chunk_set_remaining_pending" in st.session_state:
+                    del st.session_state.chunk_set_remaining_pending
+                st.rerun()
+            elif cancelled:
+                if "chunk_set_remaining_pending" in st.session_state:
+                    del st.session_state.chunk_set_remaining_pending
+                st.rerun()
+        st.divider()
+
+    if not incomplete:
+        st.info("No work scheduled for this day." if not chunks else "All chunks done for this day. ✓")
+    else:
+        for ch in incomplete:
+            name = ch.get("_task_name", "Task")
+            mins = ch.get("duration_minutes", 30)
+            task_id = ch.get("task_id", "")
+            col_chunk, col_done, col_remaining, col_task = st.columns([2, 1, 1, 1])
+            with col_chunk:
+                st.markdown(f"{name} ({mins}m)")
+            with col_done:
+                if st.button("✔ Done", key=f"chk_{ch['id']}"):
+                    mark_chunk_complete(ch["id"], actual_minutes=mins)
+                    st.rerun()
+            with col_remaining:
+                if st.button("⏱", key=f"time_{ch['id']}", help="Set expected time to complete the rest"):
+                    st.session_state.chunk_set_remaining_pending = {
+                        "id": ch["id"], "mins": mins, "name": name, "task_id": task_id
+                    }
+                    st.rerun()
+            with col_task:
+                if st.button("✓ All", key=f"task_{task_id}_{ch['id']}", help="Mark entire task as completed"):
+                    mark_task_complete(task_id)
+                    st.rerun()
 
 # =========================
 # TAB: REVIEW (Spaced Repetition)

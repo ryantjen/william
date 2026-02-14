@@ -8,7 +8,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 from config import OPENAI_API_KEY, MODEL_NAME
-from memory import retrieve_memory_with_metadata, store_memory, store_memory_if_unique, list_memories, delete_memory
+from memory import retrieve_memory_with_metadata, store_memory, store_memory_if_unique, list_memories, delete_memory, touch_memories
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -194,6 +194,10 @@ def ask_agent(user_input: str, project: str, chat_history: list = None, project_
     if answer and not answer.startswith("Sorry, I encountered"):
         threading.Thread(target=analyze_conversation_style, args=(user_input, answer), daemon=True).start()
 
+    # Background: touch cited memories for recency (non-blocking)
+    if all_citations:
+        threading.Thread(target=touch_memories, args=([m["id"] for m in all_citations],), daemon=True).start()
+
     return answer, all_citations
 
 
@@ -243,7 +247,9 @@ def ask_agent_stream(user_input: str, project: str, chat_history: list = None, p
         
         result_holder["answer"] = answer
         result_holder["citations"] = all_citations
-        
+        if all_citations:
+            threading.Thread(target=touch_memories, args=([m["id"] for m in all_citations],), daemon=True).start()
+
     except Exception as e:
         err_msg = f"Sorry, I encountered an error: {e}. Please try again."
         yield err_msg
@@ -265,23 +271,6 @@ def _chat_completion_with_retry(messages: list, max_retries: int = 2):
                 time.sleep(2 ** attempt)
                 continue
             raise last_error
-
-
-def store_simulation_memories(task: str, code: str, output: str, project: str) -> None:
-    """Extract and store memories from a code execution result. Call after run_python."""
-    memories_to_store = should_store_simulation(task, code, output, project)
-    for mem in memories_to_store:
-        if mem.get("text"):
-            store_memory_if_unique(
-                text=mem["text"],
-                metadata={
-                    "name": mem.get("name", ""),
-                    "type": mem.get("type", "result"),
-                    "importance": int(mem.get("importance", 3)),
-                    "source": "simulation"
-                },
-                project=project
-            )
 
 
 def execute_natural_language(task: str, project: str) -> str:
@@ -392,69 +381,6 @@ def should_store_memory(user_input: str, answer: str, project: str):
     if data is None:
         return []
     return data.get("memories", [])
-
-def should_store_simulation(task: str, code: str, output: str, project: str):
-    """
-    Analyze simulation results and extract multiple memories worth storing.
-    Returns a list of memory objects to store.
-    """
-    gate_prompt = f"""
-    You are deciding what should be saved into long-term research memory from a computational result.
-
-    Project: {project}
-
-    Task: {task}
-    Generated Code:
-    {code}
-
-    Output:
-    {output}
-
-    Extract ALL distinct pieces of knowledge worth remembering:
-    - Meaningful statistical results or findings
-    - Useful methodology or code patterns
-    - Reusable functions from the code
-    - Key insights from the output
-    - Decisions based on the results
-    - Any formulas or equations discovered/used
-    - Examples that could be useful later
-
-    Do NOT store:
-    - Trivial calculations or simple arithmetic
-    - Temporary debugging information
-    - Redundant or duplicate information
-
-    Return JSON with a "memories" array. Each memory should have:
-    - name (a short descriptive title, e.g. "Monte Carlo Pi Estimate", "bootstrap_ci", "Bootstrap CI Example")
-    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
-    - importance (1-5) - Use the FULL range relative to the memories you're extracting:
-      * 5 = Critical/fundamental (core results, essential methodologies, breakthrough insights)
-      * 4 = Very important (important functions, significant findings, key patterns)
-      * 3 = Moderately important (useful code patterns, helpful examples, standard results)
-      * 2 = Somewhat useful (minor optimizations, edge cases, less critical details)
-      * 1 = Nice to have (trivial calculations, obvious patterns, minor notes)
-      IMPORTANT: Distribute importance across the full 1-5 range. Don't default everything to 3+.
-    - text (the full content - see formatting rules below)
-
-    **FORMATTING RULES for text field:**
-    - For formulas/equations: Put the formula name first, then use $$...$$ for the main equation on its own line
-    - Use $...$ only for inline math within sentences
-    - For examples: Clearly label as "Example:" and show the worked solution
-    - For functions: Use function name as title, include brief description, wrap code in ```python blocks
-
-    If nothing is worth storing, return {{"memories": []}}
-    """
-
-    resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "Return only valid JSON with a 'memories' array. No markdown. Escape backslashes: use \\\\frac not \\frac."},
-            {"role": "user", "content": gate_prompt},
-        ]
-    )
-
-    data = _parse_json_from_llm(resp.choices[0].message.content)
-    return data.get("memories", []) if data else []
 
 def _get_contradicted_ids(new_text: str, mem_type: str) -> list:
     """
@@ -745,7 +671,7 @@ def summarize_conversation(chat_history: list, project: str) -> str:
             text=f"**Session Summary ({timestamp})**\n\n{summary}",
             metadata={
                 "name": f"Session Summary - {timestamp}",
-                "type": "insight",
+                "type": "summary",
                 "importance": 4,
                 "source": "conversation_summary"
             },
@@ -753,6 +679,187 @@ def summarize_conversation(chat_history: list, project: str) -> str:
         )
     
     return summary
+
+
+# =============================================================================
+# CALENDAR TASKS
+# =============================================================================
+
+
+def suggest_chunk_sizes(total_mins: int, task_name: str = "") -> list[int] | None:
+    """
+    Use LLM to suggest optimal chunk sizes from [15, 25, 30, 45, 60] minutes.
+    Prefer fewer longer chunks for deep work. Returns list of mins, or None to use fallback.
+    """
+    allowed = [15, 25, 30, 45, 60]
+    prompt = f"""Split {total_mins} minutes of work into chunks. Allowed sizes only: {allowed}.
+
+Prefer fewer, longer chunks for deep work (e.g. 60 or 45 min). Use 25-30 for shorter sessions.
+Task context: {task_name or "general"}.
+
+Return ONLY a JSON array of minutes, e.g. [30, 30, 30] or [45, 45] or [60, 15].
+The numbers must sum to {total_mins}. Use only values from {allowed}. You may combine (e.g. 15+15=30) by using multiple entries."""
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "Return only a valid JSON array. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        # Parse [30, 30, 30] or similar
+        match = re.search(r"\[[\d\s,]+\]", raw)
+        if match:
+            arr = json.loads(match.group())
+            if isinstance(arr, list) and all(isinstance(x, (int, float)) for x in arr):
+                result = [max(1, min(60, int(x))) for x in arr if x > 0]
+                if not result:
+                    return None
+                diff = total_mins - sum(result)
+                if diff != 0:
+                    result[-1] = max(15, result[-1] + diff)
+                if sum(result) == total_mins and all(15 <= x <= 60 for x in result):
+                    return result
+    except Exception:
+        pass
+    return None
+
+
+def _weekday_dates_from_today() -> str:
+    """Build explicit weekday->date mapping for the next 7 days from today."""
+    from datetime import datetime, timedelta
+    now = datetime.now().date()
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    parts = []
+    for i in range(7):
+        d = now + timedelta(days=i)
+        parts.append(f"{days[d.weekday()]}={d.strftime('%Y-%m-%d')}")
+    return ", ".join(parts)
+
+
+def _parse_weekday_in_text(text: str) -> str | None:
+    """If text contains a weekday name, return YYYY-MM-DD for next occurrence. Deterministic."""
+    from datetime import datetime, timedelta
+    text_lower = text.lower()
+    # Order by length desc so "wednesday" matches before "wed"
+    weekdays = [
+        ("wednesday", 2), ("thursday", 3), ("saturday", 5), ("tuesday", 1),
+        ("monday", 0), ("friday", 4), ("sunday", 6),
+        ("wed", 2), ("thu", 3), ("thurs", 3), ("sat", 5), ("tue", 1), ("tues", 1),
+        ("mon", 0), ("fri", 4), ("sun", 6),
+    ]
+    now = datetime.now().date()
+    for name, target_wd in weekdays:
+        if name in text_lower:
+            days_ahead = (target_wd - now.weekday() + 7) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # "today" -> next week
+            d = now + timedelta(days=days_ahead)
+            return d.strftime("%Y-%m-%d")
+    return None
+
+
+def parse_task_from_text(text: str) -> dict | None:
+    """
+    Parse natural language task input into structured fields.
+    Example: "stats hw due feb 17 (optional: should take 2 hours, priority 3/5)"
+    Returns dict with: name, due_date (YYYY-MM-DD), duration_hours, priority. Or None if parse failed.
+    """
+    from datetime import datetime
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    today_long = now.strftime("%A, %B %d, %Y")
+    year = now.year
+    weekday_map = _weekday_dates_from_today()
+
+    prompt = f"""Parse this task into structured fields. Today is {today_long} ({today}).
+
+Weekday to date (use EXACTLY these): {weekday_map}
+Example: user says "Wednesday" -> use the Wednesday date from above. "Thursday" -> use the Thursday date. Do NOT confuse weekdays.
+
+User input: "{text}"
+
+Extract:
+- name: short task name (e.g. "stats hw", "project proposal")
+- due_date: YYYY-MM-DD. For weekdays use the mapping above. For "feb 17" use {year} (or {year+1} if before today).
+- duration_hours: number if mentioned (e.g. "2 hours" -> 2, "30 min" -> 0.5). null if not mentioned
+- priority: 1-5 if mentioned (e.g. "priority 3/5" -> 3). null if not mentioned
+
+Return ONLY valid JSON: {{"name": "...", "due_date": "YYYY-MM-DD", "duration_hours": number|null, "priority": number|null}}
+If the input cannot be parsed as a task with a due date, return {{"error": "brief reason"}}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "Return only valid JSON. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        data = _parse_json_from_llm(raw)
+        if not data or data.get("error"):
+            return None
+        if not data.get("name") or not data.get("due_date"):
+            return None
+        # Override with deterministic weekday parse if present (LLM often gets weekdays wrong)
+        weekday_date = _parse_weekday_in_text(text)
+        if weekday_date:
+            data["due_date"] = weekday_date
+        return data
+    except Exception:
+        return None
+
+
+def parse_event_from_text(text: str) -> dict | None:
+    """
+    Parse natural language event input.
+    Example: "team meeting feb 14 2-3pm", "dentist feb 20 10am (1 hour)"
+    Returns: name, date (YYYY-MM-DD), start_time (HH:MM), end_time (HH:MM). Or None.
+    """
+    from datetime import datetime
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    today_long = now.strftime("%A, %B %d, %Y")
+    weekday_map = _weekday_dates_from_today()
+
+    prompt = f"""Parse this as a calendar event. Today is {today_long} ({today}).
+
+Weekday to date (use EXACTLY these): {weekday_map}
+Example: "Wednesday" -> use the Wednesday date above. "Thursday" -> use the Thursday date above.
+
+User input: "{text}"
+
+Extract:
+- name: short event name
+- date: YYYY-MM-DD (use weekday mapping above for weekdays)
+- start_time: HH:MM 24h (e.g. 14:00 for 2pm)
+- end_time: HH:MM 24h
+
+If user says "2-3pm" use 14:00-15:00. If only start given (e.g. "10am"), assume 1 hour duration.
+Return ONLY valid JSON: {{"name": "...", "date": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM"}}
+If not parseable, return {{"error": "reason"}}"""
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        data = _parse_json_from_llm(resp.choices[0].message.content)
+        if not data or data.get("error"):
+            return None
+        if not all(data.get(k) for k in ("name", "date", "start_time", "end_time")):
+            return None
+        # Override with deterministic weekday parse if present
+        weekday_date = _parse_weekday_in_text(text)
+        if weekday_date:
+            data["date"] = weekday_date
+        return data
+    except Exception:
+        return None
 
 
 # =============================================================================

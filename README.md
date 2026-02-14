@@ -4,22 +4,40 @@ An AI-powered research assistant with persistent memory, file ingestion, and Pyt
 
 ## Features
 
+### Chat & Memory
 - **Chat with Memory** - Conversations use the last 20 messages plus relevant memories from your research history
 - **Citation Tracking** - Each response shows Sources (memories referenced), displayed before Save to Memory
-- **Smart File Ingestion** - Upload PDFs, CSVs, and text files with intelligent chunking and table understanding
+- **Memory Dashboard** - Search, filter by importance (1–5), type, date; select memories; bulk delete; prune low-importance or neglected
+- **Memory Storage Health** - Popover shows total memories, disk usage, and embedding model
+- **Memory Export** - Export selected memories as JSON, Markdown, or LaTeX via an Export popover
+- **Memory Map** - Visualize your memories in 2D semantic space (UMAP); color by type, source, or importance
+- **Multiple Memory Types** - Store definitions, theorems, formulas, functions, examples, insights, and more
+- **Scope Toggle** - View memories for "This project" or "Global"
+
+### Code & Papers
 - **Code Execution** - Run Python code directly with `run:` or generate code from natural language with `nlrun:`
 - **Paper Search** - Search academic papers with `papers:` using Semantic Scholar *(faulty for now; will update later)*
-- **Memory Dashboard** - Search, filter by importance (1–5) or irrelevant tag, select memories, and bulk delete
-- **Memory Export** - Export selected memories as JSON, Markdown, or LaTeX via an Export popover
-- **Memory Map** - Visualize your memories in 2D semantic space to see clusters and connections
+
+### Files & Ingestion
+- **Smart File Ingestion** - Upload PDFs, CSVs, and text files with intelligent chunking and table understanding
+
+### Calendar
+- **Tasks & Events** - Add tasks (with hours) and events via natural language
+- **Daily Chunk Board** - One chunk per task per day; mark done, set expected time remaining, or mark entire task complete
+- **Task Completion %** - Calendar shows completion percentage per task
+- **Manage Tasks** - View tasks with completion status; auto-delete past-due tasks and past events
+
+### Review & Summarization
 - **Spaced Repetition** - Review tab with flashcard-style quiz for memorization
 - **Conversation Summaries** - Summarize chat sessions and save to memory
+
+### Projects & Personality
 - **Project Organization** - Keep research organized by project with optional goals
 - **Project Management** - Delete projects or merge them together
 - **Adaptive Personality** - Learns your communication preferences; supersedes conflicting preferences when you change them
-- **Scope Toggle** - View memories for "This project" or "Global" in the Memory Dashboard
-- **Irrelevant Tag** - Mark memories as irrelevant to filter them out or focus on them
-- **Multiple Memory Types** - Store definitions, theorems, formulas, functions, examples, insights, and more
+
+### Documentation
+- **📖 Docs Button** - Full documentation in top-right corner; comprehensive Memory System doc (storage, retrieval, decay, priority)
 
 ## Setup
 
@@ -127,15 +145,17 @@ Go to the **Files** tab to upload PDFs, CSVs, or text files. Files are processed
 ### Memory Dashboard
 Use the **Memory Dashboard** tab to search, filter, and manage your stored memories.
 
+**Storage** — Popover shows total memories, disk usage, embedding model
+
 **Filters:**
-- **Scope** - View "This project" or "Global" memories
-- **Importance** - Filter by score (1–5)
-- **Irrelevant** - Exclude irrelevant, show all, or show only irrelevant memories
-- **Type, date, keyword** - Standard search and filter
+- **Scope** — View "This project" or "Global" memories
+- **Importance** — Filter by score (1–5)
+- **Type, date, keyword** — Standard search and filter
+
+**Prune** — Remove low-importance memories (≤2) or "neglected" only (low importance + old + never cited)
 
 **Selection & actions:**
 - Select individual memories or use **Select all** / **Clear**
-- **Mark irrelevant** / **Unmark irrelevant** on individual memories
 - **Delete selected** to bulk remove memories
 
 **Export** (only selected memories):
@@ -151,6 +171,19 @@ Use the **Memory Map** tab to visualize all your memories in a 2D semantic space
 - Adjust the **spread factor** to emphasize distances between dissimilar memories
 - Connection lines show clusters of related memories
 - Color by type, source, or importance
+
+### Calendar
+Use the **Calendar** tab to manage tasks and events.
+
+**Add tasks/events** — Natural language: "stats hw due wednesday, 2 hours, priority 3/5" or "meeting feb 14 2-3pm"
+
+**Daily chunk board** — Shows one chunk per task for today. Locked to today (no day switching).
+
+- **✔ Done** — Mark chunk complete (chunk disappears)
+- **⏱** — Set expected time to complete the rest of the assignment; updates task hours and completion %
+- **✓ All** — Mark entire task as completed (100%)
+
+**Manage tasks** — View tasks with completion status and total hours. Past-due tasks and past events auto-delete when the calendar loads.
 
 ### Project Management
 - **Create projects** - Organize memories by research topic
@@ -173,6 +206,9 @@ Use the **Review** tab to test your knowledge with flashcard-style quizzes:
 ### Citation Tracking
 Each response shows **Sources** — which memories were referenced — so you can see what influenced the agent's answer. Sources appear above the Save to Memory button and persist across reruns. Click to expand and view the cited memories.
 
+### Documentation
+Click the **📖 Docs** button in the top-right corner to open full documentation. Includes a comprehensive Memory System guide (storage, retrieval, decay, priority) plus feature summaries for Chat, Files, Add Memory, Memory Dashboard, Memory Map, Calendar, and Review.
+
 ## Project Structure
 
 ```
@@ -181,8 +217,9 @@ william/
 ├── agent.py            # LLM agent and memory gating logic
 ├── memory.py           # ChromaDB memory storage/retrieval
 ├── storage.py          # Local JSON storage for projects/chat
+├── calendar_data.py    # Tasks, events, chunks (calendar.json)
+├── docs.py             # Documentation content for Docs button
 ├── tools.py            # Python code execution
-├── ingest.py           # Text chunking utilities
 ├── ingest_files.py     # File-specific ingestion (PDF, CSV, TXT)
 ├── config.py           # Configuration and API settings
 ├── requirements.txt    # Python dependencies
