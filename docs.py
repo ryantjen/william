@@ -9,7 +9,7 @@ CHAT_HELP = """
 - **run:** — Execute Python code directly.
 - **nlrun:** — Natural language → code generation and execution.
 - **papers:** — Search academic papers (Semantic Scholar).
-- **Save to Memory** — Extract and store insights from assistant replies.
+- **Save to Memory** — Extract and store insights from assistant replies. Project goal influences what gets stored.
 """
 FILES_HELP = """
 **File ingestion** — Upload PDF, TXT, or CSV to add content to memory.
@@ -21,7 +21,9 @@ FILES_HELP = """
 ADD_MEMORY_HELP = """
 **Add Memory from Text** — Paste notes, formulas, excerpts. The agent extracts and stores structured memories.
 
-- Assign type (definition, theorem, formula, etc.), importance (1–5), and confidence.
+- Works for any subject (math, biology, history, etc.). Project goal (if set) influences what gets stored and importance.
+- Types include definitions, theorems, formulas, examples, user_goal (learning goals), user_knowledge (knowledge level).
+- **🗑️ Clear** button clears the text box.
 - Duplicate detection prevents near-identical memories.
 """
 MEMORY_HELP = """
@@ -85,7 +87,7 @@ This makes IDs deterministic: storing the same text twice in the same project wi
 | Field | Purpose |
 |-------|---------|
 | `project` | Which project the memory belongs to. Empty = global (shared). |
-| `type` | e.g. definition, theorem, formula, function, example, insight, summary, pdf_chunk. |
+| `type` | e.g. definition, theorem, formula, function, example, insight, summary, pdf_chunk, user_goal, user_knowledge, user_preference, agent_trait. |
 | `importance` | 1–5. Affects retrieval ranking and pruning. Default 3. |
 | `confidence` | 0–100. Set by extractor, not used in ranking. |
 | `source` | e.g. chat, add_memory, pdf, txt, csv. |
@@ -110,6 +112,14 @@ So near-duplicate text (e.g. slightly rephrased) is skipped. Exact threshold is 
 - **store_memory_if_unique** — Checks `is_duplicate`, stores only if new. Returns ID or `None`.
 - **store_memories** — Batch store many, no dedup.
 - **store_memories_if_unique** — Batch with dedup per item. Returns `(ids_stored, duplicates_skipped)`.
+
+### Memory Extraction (Save to Memory / Add Memory)
+
+When you click **Save to Memory** (on a chat reply) or use **Add Memory** (paste text), an LLM gate extracts structured memories from the content. The extractor is **general-purpose** — it works across any subject (math, science, biology, history, programming, etc.), not just statistics. It identifies definitions, theorems, formulas, examples, insights, and similar knowledge types.
+
+**User context types** (`user_goal`, `user_knowledge`): Store facts about the user — goals (e.g. "User's goal: master hypothesis testing") and knowledge level (e.g. "User knows calculus; learning measure theory"). These are retrieved on every chat and injected into the system prompt so the agent adapts explanations accordingly.
+
+**Project goal influence:** If your project has a goal set (e.g. "learn about biology"), that goal is passed to the extractor. The model prioritizes content that supports the goal and assigns higher importance (4–5) to directly relevant knowledge. Without a goal, extraction still works; the goal just steers what gets stored and how important it is.
 
 ---
 
@@ -192,6 +202,7 @@ When you send a message, the agent fetches memories in **parallel** (ThreadPoolE
 2. **Global memories** — `retrieve_memory_with_metadata(query, None, 4)` — 4 results from global (no project).
 3. **User preferences** — `retrieve_memory_with_metadata("user preferences communication style learning", None, 5)`.
 4. **Agent traits** — `retrieve_memory_with_metadata("agent personality traits approach style", None, 5)`.
+5. **User context** — `retrieve_memory_with_metadata("user goals knowledge level current learning facts about the user", None, 5)` — goals and knowledge level (`user_goal`, `user_knowledge` types).
 
 These are merged into the system prompt. When the assistant replies and cites memories, `touch_memories(cited_ids)` runs in a **background thread** so it doesn’t add latency. That updates `last_accessed_at` for each cited memory.
 

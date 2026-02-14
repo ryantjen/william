@@ -17,14 +17,15 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 PERSONALITY_CACHE_REFRESH_EVERY = 5
 
 SYSTEM_PROMPT = """
-You are a Statistical Research Copilot named William.
+You are a Learning & Research Copilot named William. You help across any subject: math, science, biology, history, programming, statistics, etc.
 
 You help with:
-- mathematical proofs
-- statistical modeling
+- mathematical proofs and formulas
+- statistical modeling and analysis
 - simulation design
 - identifying assumptions
-- suggesting research improvements (overarching goal is to help environment)
+- learning concepts and definitions
+- suggesting research improvements
 
 Use relevant past research memory if helpful.
 Think step-by-step before answering.
@@ -64,25 +65,30 @@ def _parse_json_from_llm(raw: str) -> dict | None:
     return None
 
 
-def build_personality_prompt(user_prefs: list, agent_traits: list) -> str:
+def build_personality_prompt(user_prefs: list, agent_traits: list, user_context: list = None) -> str:
     """
-    Build a personality context block from retrieved preferences and traits.
+    Build a personality and user context block from retrieved preferences, traits, and user context.
     Accepts list of dicts with 'text' and 'confidence'. Sorts by confidence (highest first).
+    user_context: user_goal and user_knowledge memories (goals, knowledge level).
     Returns a string to inject into the system prompt.
     """
     def _format_sorted(items: list, limit: int = 5) -> str:
         if not items:
             return ""
-        # Sort by confidence desc, then recency desc (newer wins on ties)
+        # Sort by confidence desc, then importance, then recency (newer wins on ties)
         sorted_items = sorted(
             items,
-            key=lambda x: (x.get("confidence", 0), x.get("created_at", 0)),
+            key=lambda x: (x.get("confidence", 0), x.get("importance", 3), x.get("created_at", 0)),
             reverse=True
         )
         texts = [m["text"] if isinstance(m, dict) else m for m in sorted_items[:limit]]
         return "\n".join(f"- {t}" for t in texts)
 
     sections = []
+    if user_context:
+        ctx_text = _format_sorted(user_context)
+        if ctx_text:
+            sections.append(f"User context (goals, knowledge level - adapt explanations accordingly):\n{ctx_text}")
     if user_prefs:
         prefs_text = _format_sorted(user_prefs)
         if prefs_text:
@@ -98,26 +104,29 @@ def build_personality_prompt(user_prefs: list, agent_traits: list) -> str:
 def _retrieve_memories_parallel(user_input: str, project: str, include_personality: bool = True):
     """
     Run memory retrievals in parallel. If include_personality=False (cache hit), only 2 fetches.
-    Returns (project_mems, global_mems, user_prefs, agent_traits).
-    user_prefs and agent_traits are list of dicts with text, confidence (for ordering).
+    Returns (project_mems, global_mems, user_prefs, agent_traits, user_context).
+    user_prefs, agent_traits, user_context are list of dicts with text, confidence (for ordering).
+    user_context: user_goal and user_knowledge memories (goals, knowledge level).
     """
     if include_personality:
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=5) as ex:
             f1 = ex.submit(retrieve_memory_with_metadata, user_input, project, 8)
             f2 = ex.submit(retrieve_memory_with_metadata, user_input, None, 4)
             f3 = ex.submit(retrieve_memory_with_metadata, "user preferences communication style learning", None, 5)
             f4 = ex.submit(retrieve_memory_with_metadata, "agent personality traits approach style", None, 5)
+            f5 = ex.submit(retrieve_memory_with_metadata, "user goals knowledge level current learning facts about the user", None, 5)
             project_mems, global_mems = f1.result(), f2.result()
-            raw_prefs, raw_traits = f3.result(), f4.result()
+            raw_prefs, raw_traits, raw_user_ctx = f3.result(), f4.result(), f5.result()
             user_prefs = [m for m in raw_prefs if m.get("type") == "user_preference"]
             agent_traits = [m for m in raw_traits if m.get("type") == "agent_trait"]
+            user_context = [m for m in raw_user_ctx if m.get("type") in ("user_goal", "user_knowledge")]
     else:
         with ThreadPoolExecutor(max_workers=2) as ex:
             f1 = ex.submit(retrieve_memory_with_metadata, user_input, project, 8)
             f2 = ex.submit(retrieve_memory_with_metadata, user_input, None, 4)
             project_mems, global_mems = f1.result(), f2.result()
-            user_prefs, agent_traits = [], []
-    return project_mems, global_mems, user_prefs, agent_traits
+            user_prefs, agent_traits, user_context = [], [], []
+    return project_mems, global_mems, user_prefs, agent_traits, user_context
 
 
 def _get_cached_personality(project: str, chat_history_len: int) -> str | None:
@@ -163,8 +172,8 @@ def ask_agent(user_input: str, project: str, chat_history: list = None, project_
     cached_personality = _get_cached_personality(project, chat_len)
     include_personality = cached_personality is None
     
-    # Parallel memory retrieval (2 or 4 fetches depending on cache)
-    project_mems, global_mems, user_prefs, agent_traits = _retrieve_memories_parallel(user_input, project, include_personality)
+    # Parallel memory retrieval (2 or 5 fetches depending on cache)
+    project_mems, global_mems, user_prefs, agent_traits, user_context = _retrieve_memories_parallel(user_input, project, include_personality)
     
     # De-duplicate global
     project_texts = set(m["text"] for m in project_mems)
@@ -178,9 +187,9 @@ def ask_agent(user_input: str, project: str, chat_history: list = None, project_
     if cached_personality is not None:
         personality_block = cached_personality
     else:
-        personality_block = build_personality_prompt(user_prefs, agent_traits)
+        personality_block = build_personality_prompt(user_prefs, agent_traits, user_context)
         _get_cached_personality._cache[(project, chat_len // PERSONALITY_CACHE_REFRESH_EVERY)] = personality_block
-    
+
     messages = _build_messages_for_ask(user_input, project, project_goal, project_block, global_block, personality_block, chat_history)
 
     try:
@@ -213,19 +222,19 @@ def ask_agent_stream(user_input: str, project: str, chat_history: list = None, p
     cached_personality = _get_cached_personality(project, chat_len)
     include_personality = cached_personality is None
     
-    project_mems, global_mems, user_prefs, agent_traits = _retrieve_memories_parallel(user_input, project, include_personality)
-    
+    project_mems, global_mems, user_prefs, agent_traits, user_context = _retrieve_memories_parallel(user_input, project, include_personality)
+
     project_texts = set(m["text"] for m in project_mems)
     global_mems = [m for m in global_mems if m["text"] not in project_texts]
-    
+
     project_block = "\n".join(f"- {m['text']}" for m in project_mems) if project_mems else "- (none)"
     global_block = "\n".join(f"- {m['text']}" for m in global_mems) if global_mems else "- (none)"
     all_citations = project_mems + global_mems
-    
+
     if cached_personality is not None:
         personality_block = cached_personality
     else:
-        personality_block = build_personality_prompt(user_prefs, agent_traits)
+        personality_block = build_personality_prompt(user_prefs, agent_traits, user_context)
         _get_cached_personality._cache[(project, chat_len // PERSONALITY_CACHE_REFRESH_EVERY)] = personality_block
     
     messages = _build_messages_for_ask(user_input, project, project_goal, project_block, global_block, personality_block, chat_history)
@@ -309,15 +318,17 @@ Task: {task}
     
     return code_resp.choices[0].message.content
 
-def should_store_memory(user_input: str, answer: str, project: str):
+def should_store_memory(user_input: str, answer: str, project: str, project_goal: str | None = None):
     """
     Analyze conversation and extract multiple memories worth storing.
     Returns a list of memory objects to store.
+    Uses project_goal (if set) to prioritize content that supports the goal.
     """
+    goal_block = f"\n    Project goal: {project_goal}\n    Prioritize content that supports this goal. Content that directly supports the goal should generally receive higher importance (4-5).\n" if project_goal else ""
     gate_prompt = f"""
-    You are deciding what should be saved into long-term memory for a Statistical Research Copilot.
+    You are deciding what should be saved into long-term memory for a learning and research assistant (any subject: math, science, biology, history, programming, etc.).
 
-    Project: {project}
+    Project: {project}{goal_block}
 
     Conversation:
     User: {user_input}
@@ -326,13 +337,15 @@ def should_store_memory(user_input: str, answer: str, project: str):
     Extract ALL distinct pieces of knowledge worth remembering:
     - Definitions (formal definitions of terms/concepts)
     - Theorems and formulas
-    - Functions (reusable code functions worth saving)
+    - Functions (reusable code or algorithms worth saving)
     - Examples (worked examples, illustrations of concepts)
     - Insights and key observations
     - Assumptions made
     - Decisions or conclusions
     - Results and findings
     - References mentioned
+    - user_goal: When the user states a learning goal, objective, or what they want to achieve (e.g. "User's goal: master hypothesis testing")
+    - user_knowledge: When the user indicates their knowledge level, background, or what they already know (e.g. "User knows calculus; learning measure theory")
 
     Do NOT store:
     - Trivial Q&A or small talk
@@ -341,7 +354,7 @@ def should_store_memory(user_input: str, answer: str, project: str):
 
     Return JSON with a "memories" array. Each memory should have:
     - name (a short descriptive title, e.g. "Central Limit Theorem", "bootstrap_ci", "CLT Example")
-    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
+    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology, user_goal, user_knowledge)
     - importance (1-5) - Use the FULL range relative to the memories you're extracting:
       * 5 = Critical/fundamental (core theorems, essential definitions, key methodologies)
       * 4 = Very important (important functions, significant insights, major results)
@@ -515,13 +528,14 @@ def analyze_conversation_style(user_input: str, response: str):
 # ON-DEMAND MEMORY EXTRACTION (called by user action, not automatic)
 # =============================================================================
 
-def extract_memories_from_exchange(user_input: str, answer: str, project: str) -> tuple[int, int]:
+def extract_memories_from_exchange(user_input: str, answer: str, project: str, project_goal: str | None = None) -> tuple[int, int]:
     """
     On-demand: Extract and store memories from a chat exchange.
     Called when user clicks "Save to Memory" button.
+    project_goal (if set) influences what gets stored and how importance is assigned.
     Returns (stored_count, extracted_count).
     """
-    memories = should_store_memory(user_input, answer, project)
+    memories = should_store_memory(user_input, answer, project, project_goal)
     stored_count = 0
     extracted_count = sum(1 for m in memories if m.get("text"))
     
@@ -542,16 +556,18 @@ def extract_memories_from_exchange(user_input: str, answer: str, project: str) -
     
     return stored_count, extracted_count
 
-def extract_memories_from_text(text: str, project: str | None) -> int:
+def extract_memories_from_text(text: str, project: str | None, project_goal: str | None = None) -> int:
     """
     On-demand: Extract and store memories from arbitrary text input.
     Called from the "Add Memory" tab.
+    project_goal (if set) influences what gets stored and how importance is assigned.
     Returns count of memories stored.
     """
+    goal_block = f"\n    Project goal: {project_goal}\n    Prioritize content that supports this goal. Content that directly supports the goal should generally receive higher importance (4-5).\n" if project_goal else ""
     gate_prompt = f"""
-    You are extracting knowledge to save into long-term memory for a Statistical Research Copilot.
+    You are extracting knowledge to save into long-term memory for a learning and research assistant (any subject: math, science, biology, history, programming, etc.).
 
-    Project: {project or "Global"}
+    Project: {project or "Global"}{goal_block}
 
     Text to analyze:
     {text}
@@ -566,6 +582,8 @@ def extract_memories_from_text(text: str, project: str | None) -> int:
     - Important results or findings
     - References or citations
     - Methodology notes
+    - user_goal: When the user states a learning goal, objective, or what they want to achieve (e.g. "User's goal: master hypothesis testing")
+    - user_knowledge: When the user indicates their knowledge level, background, or what they already know (e.g. "User knows calculus; learning measure theory")
 
     Do NOT store:
     - Vague statements without specific content
@@ -574,7 +592,7 @@ def extract_memories_from_text(text: str, project: str | None) -> int:
 
     Return JSON with a "memories" array. Each memory should have:
     - name (a short descriptive title, e.g. "Central Limit Theorem", "bootstrap_ci", "CLT Example")
-    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology)
+    - type (one of: definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology, user_goal, user_knowledge)
     - importance (1-5) - Use the FULL range relative to the memories you're extracting:
       * 5 = Critical/fundamental (core theorems, essential definitions, foundational concepts)
       * 4 = Very important (important functions, significant insights, key methodologies)

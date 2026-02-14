@@ -23,7 +23,7 @@ def convert_latex_for_streamlit(text: str) -> str:
     return text
 
 
-STYLE_CONTEXT_TYPES = ("agent_trait", "user_preference")
+STYLE_CONTEXT_TYPES = ("agent_trait", "user_preference", "user_goal", "user_knowledge")
 
 
 def render_citations(citations: list) -> None:
@@ -43,6 +43,7 @@ def render_citations(citations: list) -> None:
 
 from storage import (
     load_projects, save_projects, get_project_names, get_project_goal, set_project_goal,
+    rename_project as storage_rename_project,
     load_chat, save_chat, delete_chat,
     load_ingested, save_ingested, clear_ingested_for_project, clear_ingested_file
 )
@@ -67,7 +68,7 @@ from calendar_data import (
     cleanup_past_due, cleanup_past_events, migrate_from_tasks,
 )
 
-st.set_page_config(page_title="Statistical Research Copilot", layout="wide")
+st.set_page_config(page_title="William — Learning & Research Copilot", layout="wide")
 
 # Header with Docs button in top-right
 header_col1, header_col2 = st.columns([4, 1])
@@ -114,7 +115,7 @@ active_project = st.sidebar.selectbox(
 )
 st.session_state.active_project = active_project
 
-# Show and edit project goal
+# Show and edit project goal (key scoped by project so switching projects shows correct goal)
 current_goal = get_project_goal(projects, active_project)
 with st.sidebar.expander("🎯 Project Goal", expanded=bool(current_goal)):
     goal_input = st.text_area(
@@ -122,7 +123,7 @@ with st.sidebar.expander("🎯 Project Goal", expanded=bool(current_goal)):
         value=current_goal or "",
         placeholder="e.g., Build a CNN classifier for cats vs dogs, Learn Real Analysis Chapter 3...",
         height=80,
-        key="goal_input"
+        key=f"goal_input_{active_project}"
     )
     if st.button("Save Goal"):
         projects = set_project_goal(projects, active_project, goal_input)
@@ -145,6 +146,37 @@ with st.sidebar.expander("➕ Add a new project", expanded=False):
             st.info("That project already exists.")
         else:
             st.warning("Enter a project name.")
+
+with st.sidebar.expander("✏️ Rename project", expanded=False):
+    if len(project_names) < 1:
+        st.warning("No projects to rename.")
+    else:
+        project_to_rename = st.selectbox(
+            "Select project to rename",
+            options=project_names,
+            key="rename_project_select"
+        )
+        new_name = st.text_input(
+            "New name",
+            placeholder="Enter new project name",
+            key="rename_new_name"
+        )
+        if st.button("Rename project"):
+            name = (new_name or "").strip()
+            if not name:
+                st.warning("Enter a new name.")
+            elif name == project_to_rename:
+                st.info("New name is the same as current name.")
+            elif name in project_names:
+                st.info("A project with that name already exists.")
+            else:
+                projects = storage_rename_project(projects, project_to_rename, name)
+                save_projects(projects)
+                merge_projects(project_to_rename, name)  # Update ChromaDB memories
+                if st.session_state.active_project == project_to_rename:
+                    st.session_state.active_project = name
+                st.success(f"Renamed '{project_to_rename}' to '{name}'.")
+                st.rerun()
 
 with st.sidebar.expander("🗑️ Delete project", expanded=False):
     if len(project_names) <= 1:
@@ -340,7 +372,8 @@ with tab_chat:
                         stored, extracted = extract_memories_from_exchange(
                             user_input=user_input,
                             answer=msg["content"],
-                            project=active_project
+                            project=active_project,
+                            project_goal=current_goal
                         )
                     if stored > 0:
                         st.success(f"Saved {stored} memory(s).")
@@ -630,19 +663,29 @@ with tab_add_memory:
     # Store current value for persistence
     st.session_state.add_memory_text_value = input_text
 
-    # Extract button
-    if st.button("🧠 Extract & Store Memories", type="primary", disabled=not input_text.strip()):
-        with st.spinner("Analyzing text and extracting memories..."):
-            count = extract_memories_from_text(input_text.strip(), project=target_project)
-        
-        if count > 0:
-            # Store success info and set clear flag, then rerun
-            st.session_state.add_memory_success = count
+    # Extract and Clear buttons
+    add_memory_goal = get_project_goal(projects, target_project) if target_project else None
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("🗑️ Clear", help="Clear the text box", key="add_memory_clear"):
             st.session_state.clear_add_memory_text = True
             st.session_state.add_memory_text_value = ""
             st.rerun()
-        else:
-            st.warning("No memories extracted. The text may not contain notable information, or similar memories already exist.")
+    with btn_col2:
+        if st.button("🧠 Extract & Store Memories", type="primary", disabled=not input_text.strip()):
+            with st.spinner("Analyzing text and extracting memories..."):
+                count = extract_memories_from_text(
+                    input_text.strip(),
+                    project=target_project,
+                    project_goal=add_memory_goal
+                )
+            if count > 0:
+                st.session_state.add_memory_success = count
+                st.session_state.clear_add_memory_text = True
+                st.session_state.add_memory_text_value = ""
+                st.rerun()
+            else:
+                st.warning("No memories extracted. The text may not contain notable information, or similar memories already exist.")
 
     st.divider()
     st.markdown("### Tips for best results")
@@ -698,7 +741,7 @@ with tab_memory:
     with colB:
         mem_type = st.selectbox(
             "Type filter",
-            ["(all)", "definition", "theorem", "formula", "function", "example", "insight", "summary", "assumption", "decision", "result", "reference", "methodology", "user_preference", "agent_trait", "pdf_chunk", "txt_chunk", "csv_chunk", "csv_summary", "csv_column", "simulation"]
+            ["(all)", "definition", "theorem", "formula", "function", "example", "insight", "summary", "assumption", "decision", "result", "reference", "methodology", "user_preference", "agent_trait", "user_goal", "user_knowledge", "pdf_chunk", "txt_chunk", "csv_chunk", "csv_summary", "csv_column"]
         )
     with colC:
         date_filter = st.selectbox(
@@ -738,7 +781,7 @@ with tab_memory:
         "",
         placeholder="e.g., theorem, CLT, regression, pdf_chunk..."
     )
-    st.caption("Searches text content, type, name, and source. Try: theorem, reference, insight, simulation, etc.")
+    st.caption("Searches text content, type, name, and source. Try: theorem, reference, insight, user_goal, etc.")
 
     items = list_memories(project=proj, where_extra=where_extra if where_extra else None, limit=limit, global_only=scope_global)
 

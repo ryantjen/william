@@ -70,6 +70,39 @@ def set_project_goal(projects: List[Dict[str, Any]], name: str, goal: Optional[s
     return projects
 
 
+def rename_project(projects: List[Dict[str, Any]], old_name: str, new_name: str) -> List[Dict[str, Any]]:
+    """
+    Rename a project. Updates projects list, chat file, and ingested records.
+    Caller must also update ChromaDB memories via memory.merge_projects(old_name, new_name).
+    Returns updated projects list.
+    """
+    if old_name == new_name:
+        return projects
+    if not any(p["name"] == old_name for p in projects):
+        return projects
+    if any(p["name"] == new_name for p in projects):
+        return projects  # New name already exists; caller should validate
+
+    # Update projects list
+    for p in projects:
+        if p["name"] == old_name:
+            p["name"] = new_name
+            break
+
+    # Migrate chat: load from old, save to new, delete old
+    old_chat = load_chat(old_name)
+    save_chat(new_name, old_chat)
+    delete_chat(old_name)
+
+    # Migrate ingested records
+    ingested = load_ingested()
+    if old_name in ingested:
+        ingested[new_name] = ingested.pop(old_name)
+        save_ingested(ingested)
+
+    return projects
+
+
 def chat_path(project: str) -> Path:
     safe = "".join(c for c in project if c.isalnum() or c in (" ", "_", "-")).strip()
     safe = safe.replace(" ", "_") or "General"

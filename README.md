@@ -1,6 +1,6 @@
-# William - Statistical Research Copilot
+# William - Learning & Research Copilot
 
-An AI-powered research assistant with persistent memory, file ingestion, and Python code execution.
+An AI-powered learning and research assistant with persistent memory, file ingestion, and Python code execution. Works across any subject (math, science, biology, history, programming, etc.).
 
 ## Features
 
@@ -11,7 +11,7 @@ An AI-powered research assistant with persistent memory, file ingestion, and Pyt
 - **Memory Storage Health** - Popover shows total memories, disk usage, and embedding model
 - **Memory Export** - Export selected memories as JSON, Markdown, or LaTeX via an Export popover
 - **Memory Map** - Visualize your memories in 2D semantic space (UMAP); color by type, source, or importance
-- **Multiple Memory Types** - Store definitions, theorems, formulas, functions, examples, insights, and more
+- **Multiple Memory Types** - Store definitions, theorems, formulas, functions, examples, insights, user goals, knowledge level, and more
 - **Scope Toggle** - View memories for "This project" or "Global"
 
 ### Code & Papers
@@ -33,8 +33,9 @@ An AI-powered research assistant with persistent memory, file ingestion, and Pyt
 
 ### Projects & Personality
 - **Project Organization** - Keep research organized by project with optional goals
-- **Project Management** - Delete projects or merge them together
+- **Project Management** - Create, rename, delete, or merge projects
 - **Adaptive Personality** - Learns your communication preferences; supersedes conflicting preferences when you change them
+- **User Context** - Store goals and knowledge level (`user_goal`, `user_knowledge`); the agent adapts explanations accordingly
 
 ### Documentation
 - **📖 Docs Button** - Full documentation in top-right corner; comprehensive Memory System doc (storage, retrieval, decay, priority)
@@ -123,10 +124,10 @@ papers: bootstrap confidence intervals
 *Faulty for now — will update later.* Intended to search Semantic Scholar for relevant papers and save results to memory.
 
 ### Save to Memory
-Click the 💾 **Save to Memory** button on any assistant message to extract and store important knowledge (theorems, insights, formulas, etc.).
+Click the 💾 **Save to Memory** button on any assistant message to extract and store important knowledge (theorems, insights, formulas, etc.). If your project has a goal set (e.g. "learn about biology"), that goal influences what gets stored and how important it is.
 
 ### Add Memory
-Use the **Add Memory** tab to paste text (notes, formulas, excerpts, code) and have the agent extract structured memories from it. The agent will automatically categorize content as definitions, theorems, formulas, functions, examples, etc.
+Use the **Add Memory** tab to paste text (notes, formulas, excerpts, code) and have the agent extract structured memories from it. The agent works for any subject (math, biology, history, etc.). Project goals influence what gets stored and importance. Content is automatically categorized as definitions, theorems, formulas, functions, examples, user goals, knowledge level, etc. Use the **🗑️ Clear** button to clear the text box.
 
 ### File Ingestion
 Go to the **Files** tab to upload PDFs, CSVs, or text files. Files are processed with smart chunking that respects natural boundaries (sections, paragraphs, sentences).
@@ -163,7 +164,7 @@ Use the **Memory Dashboard** tab to search, filter, and manage your stored memor
 - 📥 Markdown - Human-readable format
 - 📥 LaTeX - Ready to compile for papers/documents
 
-**Memory types include:** definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology
+**Memory types include:** definition, theorem, formula, function, example, insight, assumption, decision, result, reference, methodology, user_goal, user_knowledge, user_preference, agent_trait
 
 ### Memory Map
 Use the **Memory Map** tab to visualize all your memories in a 2D semantic space. Similar memories cluster together, making it easy to see relationships. Click on any point to view the full memory content.
@@ -187,7 +188,8 @@ Use the **Calendar** tab to manage tasks and events.
 
 ### Project Management
 - **Create projects** - Organize memories by research topic
-- **Set project goals** - Add optional goals that provide context to the agent
+- **Set project goals** - Add optional goals that provide context to the agent and influence memory extraction (what gets stored and importance)
+- **Rename projects** - Change a project's name; memories, chat, and ingestion records are migrated
 - **Delete projects** - Remove a project and all its associated memories
 - **Merge projects** - Combine two projects, moving all memories from source to target
 

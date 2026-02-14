@@ -12,22 +12,8 @@ from typing import List, Dict, Any, Optional
 from storage import DATA_DIR
 
 
-def _get_chunk_sizes(today_mins: int, task_name: str = "") -> List[int]:
-    """Use LLM to suggest chunk sizes if available; else fall back to algorithmic split."""
-    try:
-        from agent import suggest_chunk_sizes
-        suggested = suggest_chunk_sizes(today_mins, task_name)
-        if suggested:
-            return suggested
-    except Exception:
-        pass
-    return _optimal_chunk_sizes(today_mins)
-
-
-def get_chunks_for_date_read_only(date_str: str) -> List[Dict]:
-    """Get chunks without running _ensure_chunks_for_date (for testing/display after completion)."""
-    data = _load()
-    chunks = [c for c in data.get("chunks", []) if c.get("date") == date_str]
+def _enrich_chunks_with_task_info(data: dict, chunks: List[Dict]) -> List[Dict]:
+    """Add _task_name and _task_due to chunks, sort by priority then created_at."""
     task_map = {t["id"]: t for t in data.get("tasks", [])}
     for c in chunks:
         t = task_map.get(c.get("task_id", ""), {})
@@ -36,11 +22,14 @@ def get_chunks_for_date_read_only(date_str: str) -> List[Dict]:
     chunks.sort(key=lambda x: (-(x.get("priority") or 0), x.get("created_at", 0)))
     return chunks
 
-CALENDAR_FILE = DATA_DIR / "calendar.json"
 
-DEFAULT_CHUNK_MINUTES = 30
-WORK_DAY_START = 9 * 60   # 9:00 in minutes from midnight
-WORK_DAY_END = 18 * 60    # 18:00
+def get_chunks_for_date_read_only(date_str: str) -> List[Dict]:
+    """Get chunks without running _ensure_chunks_for_date (for display after completion)."""
+    data = _load()
+    chunks = [c for c in data.get("chunks", []) if c.get("date") == date_str]
+    return _enrich_chunks_with_task_info(data, chunks)
+
+CALENDAR_FILE = DATA_DIR / "calendar.json"
 
 
 def _load() -> dict:
@@ -130,10 +119,6 @@ def delete_event(event_id: str) -> bool:
 
 # ----- Chunks -----
 
-def load_chunks() -> List[Dict]:
-    return _load().get("chunks", [])
-
-
 def _chunks_for_task(chunks: List[Dict], task_id: str) -> List[Dict]:
     return [c for c in chunks if c.get("task_id") == task_id]
 
@@ -141,34 +126,6 @@ def _chunks_for_task(chunks: List[Dict], task_id: str) -> List[Dict]:
 def _hours_completed_for_task(chunks: List[Dict], task_id: str) -> float:
     completed = [c for c in _chunks_for_task(chunks, task_id) if c.get("completed")]
     return sum((c.get("duration_minutes") or 0) / 60.0 for c in completed)
-
-
-def _optimal_chunk_sizes(total_mins: int) -> List[int]:
-    """
-    Split total_mins into chunks of 15, 25, 30, 45, or 60 min.
-    Prefer fewer, longer chunks for deep work; use 25-30 for shorter sessions.
-    """
-    if total_mins <= 0:
-        return []
-    preferred = [60, 45, 30, 25, 15]
-    chunks = []
-    remaining = total_mins
-    while remaining > 0:
-        used = False
-        for size in preferred:
-            if size <= remaining:
-                chunks.append(size)
-                remaining -= size
-                used = True
-                break
-        if not used:
-            # Merge remainder into last chunk
-            if chunks:
-                chunks[-1] += remaining
-            else:
-                chunks.append(remaining)
-            break
-    return chunks
 
 
 def _overdue_chunks(chunks: List[Dict], before_date: str) -> List[Dict]:
@@ -182,11 +139,10 @@ def _overdue_chunks(chunks: List[Dict], before_date: str) -> List[Dict]:
 def _ensure_chunks_for_date(date_str: str) -> None:
     """
     Generate and store chunks for date_str if not already present.
-    Considers: tasks, events, overdue chunks, priority.
+    Considers: tasks, overdue chunks, priority.
     """
     data = _load()
     tasks = data.get("tasks", [])
-    events = data.get("events", [])
     chunks = data.get("chunks", [])
 
     today = time.strftime("%Y-%m-%d")
@@ -200,7 +156,6 @@ def _ensure_chunks_for_date(date_str: str) -> None:
 
     # Active tasks with work remaining
     active = [t for t in tasks if (t.get("due_date") or "") >= date_str]
-    task_map = {t["id"]: t for t in active}
 
     # Overdue: incomplete chunks from before this date
     overdue = _overdue_chunks(chunks, date_str)
@@ -211,12 +166,8 @@ def _ensure_chunks_for_date(date_str: str) -> None:
             overdue_by_task[tid] = []
         overdue_by_task[tid].append(c)
 
-    # Events on this day (blocked time)
-    day_events = [e for e in events if e.get("date") == date_str]
-
     # Build list of chunks to create
     new_chunks: List[Dict] = []
-    existing_for_date = [c for c in chunks if c.get("date") == date_str]
 
     for task in active:
         if task.get("completed"):
@@ -297,13 +248,7 @@ def get_chunks_for_date(date_str: str) -> List[Dict]:
     _ensure_chunks_for_date(date_str)
     data = _load()
     chunks = [c for c in data.get("chunks", []) if c.get("date") == date_str]
-    task_map = {t["id"]: t for t in data.get("tasks", [])}
-    for c in chunks:
-        t = task_map.get(c.get("task_id", ""), {})
-        c["_task_name"] = t.get("name", "Task")
-        c["_task_due"] = t.get("due_date", "")
-    chunks.sort(key=lambda x: (-(x.get("priority") or 0), x.get("created_at", 0)))
-    return chunks
+    return _enrich_chunks_with_task_info(data, chunks)
 
 
 def mark_chunk_complete(chunk_id: str, actual_minutes: Optional[int] = None) -> bool:
@@ -363,16 +308,6 @@ def get_task_completion_pct(task_id: str) -> Optional[int]:
     completed = _hours_completed_for_task(chunks, task_id)
     pct = int(round(100 * completed / total))
     return min(100, max(0, pct))
-
-
-def delete_chunk(chunk_id: str) -> bool:
-    data = _load()
-    before = len(data.get("chunks", []))
-    data["chunks"] = [c for c in data.get("chunks", []) if c.get("id") != chunk_id]
-    if len(data["chunks"]) < before:
-        _save(data)
-        return True
-    return False
 
 
 def cleanup_past_due() -> int:
